@@ -77,3 +77,15 @@ Options:
 - `--mpv` plays through mpv like the Pi does, instead of pygame. Use it to test the Pi's playback code.
 
 Each button's label shows what it does on the current screen. Saved state goes to the same `~/.local/state/pirateplayer/` file as on the Pi, so the simulator resumes where you left off too.
+
+## Tests
+
+The tests cover everything except the hardware drivers, mpv and the simulator window, so they run on any computer:
+
+```sh
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m pytest
+```
+
+GitHub Actions runs them on every push and pull request.
