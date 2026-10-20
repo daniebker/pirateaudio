@@ -42,6 +42,8 @@ The script:
 - enables USB gadget mode and sets up `umtp-responder` to share `~/Music` over MTP
 - installs and enables the `pirateplayer` and `pirateplayer-mtp` systemd services
 
+To update the Pi from your computer, run `scripts/deploy.sh`. It copies the project to `~/pirateplayer` on `pirateaudio.local` (set `PI_HOST` to use another host) and restarts the player if its code changed. `scripts/deploy.sh --install` also re-runs `install.sh` and reboots. Both ask for your sudo password on the Pi.
+
 Put your music in `~/Music`, over USB (below) or over the network with `scp` or `rsync`. Logs: `journalctl -u pirateplayer -f`.
 
 ## Copying music over USB
