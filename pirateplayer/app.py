@@ -8,10 +8,11 @@ import time
 from pathlib import Path
 
 from . import buttons as btn
+from .bluetooth import audio_device
 from .config import Config
 from .library import TrackInfo, is_track, list_dir, read_info, tracks_in
 from .player import PLAYING, STOPPED, Player
-from .ui import Renderer
+from .ui import MenuEntry, Renderer
 
 log = logging.getLogger(__name__)
 
@@ -21,31 +22,54 @@ SAVE_INTERVAL = 30.0
 LOW_BATTERY_READINGS = 3  # consecutive low readings before powering off
 VOLUME_STEP = 5
 RESTART_THRESHOLD = 3.0   # "previous" restarts the track if we're further in than this
+SCAN_TIME = 30.0          # seconds a Bluetooth scan runs for
+MESSAGE_TIME = 5.0        # seconds a Bluetooth message stays up
 
-BROWSER, NOW_PLAYING = "browser", "now_playing"
+MENU, BROWSER, NOW_PLAYING, BLUETOOTH = "menu", "browser", "now_playing", "bluetooth"
+FILES_ENTRY = MenuEntry("Files", "folder")
+BLUETOOTH_ENTRY = MenuEntry("Bluetooth", "bluetooth")
+
+
+def move_cursor(cursor: int, count: int, step: int, kind: str) -> int:
+    """Taps wrap around the ends of a list; holding stops at them."""
+    if kind == btn.TAP:
+        return (cursor + step) % count
+    return min(max(0, cursor + step), count - 1)
 
 
 class App:
-    def __init__(self, cfg: Config, display, buttons, battery, player: Player, simulate=False):
+    def __init__(self, cfg: Config, display, buttons, battery, player: Player, simulate=False,
+                 bluetooth=None):
         self.cfg = cfg
         self.display = display
         self.buttons = buttons
         self.battery = battery
         self.player = player
         self.simulate = simulate
+        self.bluetooth = bluetooth
         self.ui = Renderer()
 
-        self.screen = BROWSER
+        self.screen = MENU
+        self.menu = [FILES_ENTRY, BLUETOOTH_ENTRY] if bluetooth else [FILES_ENTRY]
+        self.menu_cursor = 0
         self.root = cfg.music_dir
         self.cwd = self.root
         self.entries = list_dir(self.cwd)
         self.cursor = 0
 
+        self.bt_selected: str | None = None  # address of the selected device; None = the scan row
+        self.bt_audio: str | None = None     # address of the headset we're playing to
+        self.bt_last: str | None = None      # the last headset played to, to reconnect at startup
+        self.bt_message = ""
+        self.bt_message_until = 0.0
+        self.scan_until = 0.0
+
         self.playlist: list[Path] = []
         self.index = 0
         self.info: TrackInfo | None = None
         self.failures = 0  # consecutive tracks that failed to play
-        self.volume = cfg.volume
+        self.speaker_volume = cfg.volume
+        self.bluetooth_volume = cfg.bluetooth_volume
 
         self.battery_status = None
         self.low_battery_count = 0
@@ -53,29 +77,52 @@ class App:
         self.dirty = True
         self.running = True
         self.last_input = self.last_battery = self.last_save = self.last_poll = 0.0
+        self.now = 0.0  # the time of the tick or button press being handled
+
+    @property
+    def volume(self) -> int:
+        """The volume of whatever is playing: headphones and speaker each keep their own."""
+        return self.bluetooth_volume if self.bt_audio else self.speaker_volume
+
+    @volume.setter
+    def volume(self, value: int):
+        if self.bt_audio:
+            self.bluetooth_volume = value
+        else:
+            self.speaker_volume = value
 
     # ---- lifecycle -------------------------------------------------------
 
     def start(self):
         self.display.set_backlight(True)
         self.restore_state()
-        self.last_input = time.monotonic()
+        self.now = self.last_input = time.monotonic()
+        if self.bluetooth and self.bt_last:
+            # Most headsets connect back by themselves when switched on, but not all.
+            self.bluetooth.connect(self.bt_last, quiet=True)
 
     def run(self):
         self.start()
         try:
+            # Buttons that can wake the loop early make presses take effect without waiting
+            # out the rest of the tick.
+            wait = getattr(self.buttons, "wait", time.sleep)
             while self.running:
                 self.tick(time.monotonic())
-                time.sleep(TICK)
+                wait(TICK)
         finally:
             self.save_state()
 
     def tick(self, now: float):
+        self.now = now
         for name, kind in self.buttons.poll():
             self.on_button(name, kind, now)
 
         while not self.player.events.empty():
             self.on_player_event(*self.player.events.get())
+
+        if self.bluetooth:
+            self.tick_bluetooth(now)
 
         if now - self.last_battery >= BATTERY_INTERVAL:
             self.last_battery = now
@@ -100,17 +147,26 @@ class App:
             self.display.show(self.render())
 
     def render(self):
+        bt = self.bt_audio is not None
+        if self.screen == MENU:
+            return self.ui.menu(self.menu, self.menu_cursor, {BLUETOOTH_ENTRY: self.headset_name()},
+                                self.battery_status, self.player.state == PLAYING, bt)
         if self.screen == BROWSER:
             title = "Music" if self.cwd == self.root else self.cwd.name
             return self.ui.browser(title, self.entries, self.cursor, self.battery_status,
-                                   self.player.state == PLAYING)
+                                   self.player.state == PLAYING, bt)
+        if self.screen == BLUETOOTH:
+            devices = self.bluetooth.devices()
+            return self.ui.bluetooth(devices, self.bt_cursor(devices), self.bluetooth.scanning,
+                                     max(0.0, self.scan_until - self.now), self.bt_message,
+                                     self.battery_status)
         return self.ui.now_playing(self.info, self.player.state, self.player.position, self.volume,
-                                   self.index, len(self.playlist), self.battery_status)
+                                   self.index, len(self.playlist), self.battery_status, bt)
 
     # ---- input -------------------------------------------------------------
 
     def on_button(self, name: str, kind: str, now: float):
-        self.last_input = now
+        self.now = self.last_input = now
         if not self.awake:
             # The press that wakes the screen doesn't also do something unseen.
             self.awake = True
@@ -120,19 +176,36 @@ class App:
         if name == btn.COMBO:
             self.power_off("Powering off…")
             return
-        if self.screen == BROWSER:
+        if self.screen == MENU:
+            self.menu_button(name, kind)
+        elif self.screen == BROWSER:
             self.browser_button(name, kind)
+        elif self.screen == BLUETOOTH:
+            self.bluetooth_button(name, kind)
         else:
             self.now_playing_button(name, kind)
         self.dirty = True
 
+    def menu_button(self, name: str, kind: str):
+        if name in ("A", "B"):
+            self.menu_cursor = move_cursor(self.menu_cursor, len(self.menu),
+                                           -1 if name == "A" else 1, kind)
+        elif name == "X" and kind != btn.REPEAT:
+            if self.menu[self.menu_cursor] is FILES_ENTRY:
+                self.screen = BROWSER
+                self.open_dir(self.root)
+            else:
+                self.open_bluetooth()
+        elif name == "Y" and kind != btn.REPEAT and self.playlist:
+            self.screen = NOW_PLAYING
+
+    def open_menu(self, select: MenuEntry):
+        self.screen = MENU
+        self.menu_cursor = self.menu.index(select)
+
     def browser_button(self, name: str, kind: str):
         if name in ("A", "B") and self.entries:
-            step = -1 if name == "A" else 1
-            if kind == btn.TAP:
-                self.cursor = (self.cursor + step) % len(self.entries)
-            else:
-                self.cursor = min(max(0, self.cursor + step), len(self.entries) - 1)
+            self.cursor = move_cursor(self.cursor, len(self.entries), -1 if name == "A" else 1, kind)
         elif name == "X" and kind != btn.REPEAT and self.entries:
             entry = self.entries[self.cursor]
             if entry.is_dir() and kind == btn.TAP:
@@ -142,9 +215,12 @@ class App:
             else:
                 tracks = [p for p in self.entries if not p.is_dir()]
                 self.play(tracks, tracks.index(entry))
-        elif name == "Y" and kind == btn.TAP and self.cwd != self.root:
-            self.open_dir(self.cwd.parent, select=self.cwd)
-        elif name == "Y" and kind != btn.REPEAT and self.playlist:
+        elif name == "Y" and kind == btn.TAP:
+            if self.cwd != self.root:
+                self.open_dir(self.cwd.parent, select=self.cwd)
+            else:
+                self.open_menu(FILES_ENTRY)
+        elif name == "Y" and kind == btn.HOLD and self.playlist:
             self.screen = NOW_PLAYING
 
     def now_playing_button(self, name: str, kind: str):
@@ -177,6 +253,103 @@ class App:
         self.cwd = directory
         self.entries = list_dir(directory)
         self.cursor = self.entries.index(select) if select in self.entries else 0
+
+    # ---- bluetooth ---------------------------------------------------------
+
+    def open_bluetooth(self):
+        self.screen = BLUETOOTH
+        self.bt_selected = None
+        self.start_scan()
+
+    def start_scan(self):
+        self.scan_until = self.now + SCAN_TIME
+        self.bluetooth.start_scan()
+
+    def bt_cursor(self, devices) -> int:
+        """The selected row, counting the scan row as 0, following the device if it moved."""
+        for row, device in enumerate(devices, start=1):
+            if device.address == self.bt_selected:
+                return row
+        return 0
+
+    def bluetooth_button(self, name: str, kind: str):
+        devices = self.bluetooth.devices()
+        cursor = self.bt_cursor(devices)
+        device = devices[cursor - 1] if cursor else None
+        if name in ("A", "B"):
+            cursor = move_cursor(cursor, len(devices) + 1, -1 if name == "A" else 1, kind)
+            self.bt_selected = devices[cursor - 1].address if cursor else None
+        elif name == "X" and kind == btn.TAP:
+            if device is None:
+                if self.bluetooth.scanning:
+                    self.bluetooth.stop_scan()
+                else:
+                    self.start_scan()
+            elif device.busy:
+                pass
+            elif device.connected:
+                self.bluetooth.disconnect(device.address)
+            else:
+                self.bluetooth.connect(device.address)
+        elif name == "X" and kind == btn.HOLD and device is not None and device.paired:
+            self.bluetooth.forget(device.address)
+            if device.address == self.bt_last:
+                self.bt_last = None
+                self.save_state()
+            self.show_message(f"Forgot {device.name}")
+        elif name == "Y" and kind != btn.REPEAT:
+            self.bluetooth.stop_scan()
+            self.open_menu(BLUETOOTH_ENTRY)
+
+    def tick_bluetooth(self, now: float):
+        self.bluetooth.poll()
+        while not self.bluetooth.events.empty():
+            self.on_bluetooth_event(*self.bluetooth.events.get())
+        if self.bluetooth.scanning and now >= self.scan_until:
+            self.bluetooth.stop_scan()
+        if self.bt_message and now >= self.bt_message_until:
+            self.bt_message = ""
+            self.dirty = True
+        # Count the scan down on screen.
+        if self.screen == BLUETOOTH and self.bluetooth.scanning and now - self.last_poll >= 1.0:
+            self.last_poll = now
+            self.dirty = True
+
+    def on_bluetooth_event(self, kind: str, detail):
+        if kind == "audio":
+            self.route_audio(detail)
+        elif kind == "error":
+            self.show_message(detail)
+        self.dirty = True
+
+    def route_audio(self, address: str | None):
+        """Play to the headset that just connected, or back to the speaker when it's gone."""
+        if address == self.bt_audio:
+            return
+        if address:
+            log.info("Playing to Bluetooth headset %s", address)
+            self.player.set_audio_device(audio_device(address))
+            self.bt_last = address
+        else:
+            log.info("Bluetooth headset gone; back to %s", self.cfg.audio_device or "the speaker")
+            # Like a phone: losing the headset pauses, rather than carrying on out loud.
+            self.player.pause()
+            self.player.set_audio_device(self.cfg.audio_device)
+        self.bt_audio = address
+        self.player.set_volume(self.volume)
+        self.save_state()
+
+    def headset_name(self) -> str:
+        """The name of the headset we're playing to, for the menu."""
+        if self.bluetooth and self.bt_audio:
+            for device in self.bluetooth.devices():
+                if device.address == self.bt_audio:
+                    return device.name
+        return ""
+
+    def show_message(self, text: str):
+        self.bt_message = text
+        self.bt_message_until = self.now + MESSAGE_TIME
 
     # ---- playback ----------------------------------------------------------
 
@@ -263,7 +436,9 @@ class App:
             "playlist": [str(p) for p in self.playlist],
             "index": self.index,
             "position": self.player.position,
-            "volume": self.volume,
+            "volume": self.speaker_volume,
+            "bluetooth_volume": self.bluetooth_volume,
+            "bluetooth": self.bt_last,
         }
         path = self.cfg.state_file
         try:
@@ -280,7 +455,9 @@ class App:
         except (OSError, ValueError):
             self.player.set_volume(self.volume)
             return
-        self.volume = int(state.get("volume", self.volume))
+        self.speaker_volume = int(state.get("volume", self.speaker_volume))
+        self.bluetooth_volume = int(state.get("bluetooth_volume", self.bluetooth_volume))
+        self.bt_last = state.get("bluetooth")
         self.player.set_volume(self.volume)
         playlist = [Path(p) for p in state.get("playlist", [])]
         index = int(state.get("index", 0))

@@ -1,10 +1,13 @@
-"""Drawing the browser and now-playing screens."""
+"""Drawing the browser, now-playing and Bluetooth screens."""
 
+from functools import lru_cache
 from pathlib import Path
+from typing import NamedTuple
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from .battery import BatteryStatus
+from .bluetooth import BtDevice
 from .display import SIZE
 from .library import TrackInfo
 
@@ -15,6 +18,7 @@ ACCENT = (255, 168, 38)
 SELECTED = (52, 54, 68)
 LOW = (235, 70, 60)
 GOOD = (90, 200, 110)
+BLUE = (80, 150, 255)
 
 HEADER = 28
 ROW = 26
@@ -24,6 +28,12 @@ ART = 104
 FONT_DIR = Path("/usr/share/fonts/truetype/dejavu")
 
 
+class MenuEntry(NamedTuple):
+    """A row of the top-level menu, which opens another screen."""
+    label: str
+    icon: str  # "folder" or "bluetooth"
+
+
 def _font(name: str, size: int):
     try:
         return ImageFont.truetype(str(FONT_DIR / name), size)
@@ -31,12 +41,50 @@ def _font(name: str, size: int):
         return ImageFont.load_default(size)
 
 
-def _fit(draw: ImageDraw.ImageDraw, text: str, font, width: float) -> str:
-    if draw.textlength(text, font=font) <= width:
+_MEASURE = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+
+
+@lru_cache(maxsize=2048)
+def _fit(text: str, font, width: float) -> str:
+    """Shorten text with an ellipsis to fit width. Measuring text is slow on a Pi Zero, so this
+    searches for the cut point instead of trimming a character at a time, and remembers results:
+    the same folder names are drawn over and over."""
+    if _MEASURE.textlength(text, font=font) <= width:
         return text
-    while text and draw.textlength(text + "…", font=font) > width:
-        text = text[:-1]
-    return text.rstrip() + "…"
+    fits, too_long = 0, len(text)  # the longest prefix known to fit, the shortest known not to
+    while too_long - fits > 1:
+        middle = (fits + too_long) // 2
+        if _MEASURE.textlength(text[:middle] + "…", font=font) <= width:
+            fits = middle
+        else:
+            too_long = middle
+    return text[:fits].rstrip() + "…"
+
+
+def _top(cursor: int, count: int) -> int:
+    """The first row to show so the cursor stays roughly in the middle of a scrolling list."""
+    return min(max(0, cursor - ROWS // 2), max(0, count - ROWS))
+
+
+def _scrollbar(draw, top: int, count: int):
+    if count > ROWS:
+        track = SIZE - HEADER
+        bar = max(12, track * ROWS // count)
+        y = HEADER + (track - bar) * top // (count - ROWS)
+        draw.rectangle((SIZE - 4, y, SIZE - 1, y + bar), fill=DIM)
+
+
+def _bluetooth_icon(draw, x: int, y: int, colour, h: int = 12):
+    """The Bluetooth rune, h pixels tall with its spine at x."""
+    w = h // 4
+    draw.line([(x - w, y + h * 3 // 4), (x + w, y + h // 4), (x, y), (x, y + h),
+               (x + w, y + h * 3 // 4), (x - w, y + h // 4)], fill=colour, width=1)
+
+
+def _folder_icon(draw, x: int, y: int, colour):
+    """A folder, 16x12 pixels with its top-left corner at x, y."""
+    draw.rectangle((x, y, x + 6, y + 2), fill=colour)
+    draw.rectangle((x, y + 2, x + 16, y + 12), fill=colour)
 
 
 def _clock(seconds: float) -> str:
@@ -74,44 +122,110 @@ class Renderer:
         draw.text((lx, 8), label, font=self.small, fill=DIM)
         return int(lx)
 
-    def _header(self, draw, title: str, battery, extra: str = ""):
+    def _header(self, draw, title: str, battery, extra: str = "", bluetooth: bool = False):
         draw.rectangle((0, 0, SIZE, HEADER - 2), fill=(26, 27, 36))
         right = self._battery(draw, battery, SIZE - 4)
         if extra:
             right -= int(draw.textlength(extra, font=self.small)) + 8
             draw.text((right, 8), extra, font=self.small, fill=ACCENT)
-        draw.text((6, 5), _fit(draw, title, self.bold, right - 12), font=self.bold, fill=FG)
+        if bluetooth:  # playing through a headset
+            right -= 14
+            _bluetooth_icon(draw, right + 5, 7, BLUE)
+        draw.text((6, 5), _fit(title, self.bold, right - 12), font=self.bold, fill=FG)
+
+    def menu(self, entries: list[MenuEntry], cursor: int, status: dict[MenuEntry, str],
+             battery: BatteryStatus | None, playing: bool, bluetooth: bool = False) -> Image.Image:
+        """The top-level menu. `status` is shown at the right of the rows it has text for."""
+        image, draw = self._canvas()
+        self._header(draw, "Menu", battery, "▶" if playing else "", bluetooth)
+        for row, entry in enumerate(entries):
+            y = HEADER + row * ROW
+            if row == cursor:
+                draw.rectangle((0, y, SIZE, y + ROW - 1), fill=SELECTED)
+            if entry.icon == "bluetooth":
+                colour = BLUE
+                _bluetooth_icon(draw, 16, y + 6, colour, h=14)
+            else:
+                colour = ACCENT
+                _folder_icon(draw, 8, y + 7, colour)
+            draw.text((32, y + 4), entry.label, font=self.text, fill=colour)
+            text = status.get(entry, "")
+            if text:
+                left = 40 + int(draw.textlength(entry.label, font=self.text))
+                text = _fit(text, self.small, SIZE - 10 - left)
+                draw.text((SIZE - 10, y + 6), text, font=self.small, fill=GOOD, anchor="ra")
+        return image
 
     def browser(self, title: str, entries: list[Path], cursor: int,
-                battery: BatteryStatus | None, playing: bool) -> Image.Image:
+                battery: BatteryStatus | None, playing: bool, bluetooth: bool = False) -> Image.Image:
         image, draw = self._canvas()
-        self._header(draw, title, battery, "▶" if playing else "")
+        self._header(draw, title, battery, "▶" if playing else "", bluetooth)
         if not entries:
             draw.text((SIZE // 2, SIZE // 2), "No music here", font=self.text, fill=DIM, anchor="mm")
             return image
 
-        top = min(max(0, cursor - ROWS // 2), max(0, len(entries) - ROWS))
+        top = _top(cursor, len(entries))
         for row, entry in enumerate(entries[top:top + ROWS]):
             y = HEADER + row * ROW
             if top + row == cursor:
                 draw.rectangle((0, y, SIZE, y + ROW - 1), fill=SELECTED)
             is_dir = entry.is_dir()
             label = entry.name + "/" if is_dir else entry.stem
-            draw.text((8, y + 4), _fit(draw, label, self.text, SIZE - 22), font=self.text,
+            draw.text((8, y + 4), _fit(label, self.text, SIZE - 22), font=self.text,
                       fill=ACCENT if is_dir else FG)
+        _scrollbar(draw, top, len(entries))
+        return image
 
-        if len(entries) > ROWS:
-            track = SIZE - HEADER
-            bar = max(12, track * ROWS // len(entries))
-            y = HEADER + (track - bar) * top // (len(entries) - ROWS)
-            draw.rectangle((SIZE - 4, y, SIZE - 1, y + bar), fill=DIM)
+    def bluetooth(self, devices: list[BtDevice], cursor: int, scanning: bool, scan_left: float,
+                  message: str, battery: BatteryStatus | None) -> Image.Image:
+        """Row 0 starts or stops a scan; the rest are devices. `cursor` counts row 0."""
+        image, draw = self._canvas()
+        self._header(draw, "Bluetooth", battery, bluetooth=any(d.connected for d in devices))
+        count = len(devices) + 1
+        top = _top(cursor, count)
+        for row in range(top, min(count, top + ROWS)):
+            y = HEADER + (row - top) * ROW
+            if row == cursor:
+                draw.rectangle((0, y, SIZE, y + ROW - 1), fill=SELECTED)
+            if row == 0:
+                label = f"Scanning… {scan_left:.0f}s" if scanning else "Scan for headsets"
+                draw.text((8, y + 4), label, font=self.text, fill=BLUE)
+                continue
+            device = devices[row - 1]
+            if device.busy:
+                status, colour = device.busy, ACCENT
+            elif device.connected:
+                status, colour = "Connected", GOOD
+            elif device.paired:
+                status, colour = "Paired", DIM
+            else:
+                status, colour = "", DIM
+            right = SIZE - 10
+            if status:
+                right -= int(draw.textlength(status, font=self.small))
+                draw.text((right, y + 6), status, font=self.small, fill=colour)
+            draw.text((8, y + 4), _fit(device.name, self.text, right - 16), font=self.text,
+                      fill=FG)
+        _scrollbar(draw, top, count)
+
+        if scanning and not any(not d.paired for d in devices) and count < ROWS:
+            draw.multiline_text((SIZE // 2, HEADER + count * ROW + 30),
+                                "Put your headset\nin pairing mode", font=self.text, fill=DIM,
+                                anchor="ma", align="center")
+        if message:
+            lines = message.count("\n") + 1
+            box = 10 + 18 * lines
+            draw.rectangle((0, SIZE - box, SIZE, SIZE), fill=(26, 27, 36))
+            draw.multiline_text((SIZE // 2, SIZE - box // 2), message, font=self.small, fill=FG,
+                                anchor="mm", align="center")
         return image
 
     def now_playing(self, info: TrackInfo | None, state: str, position: float, volume: int,
-                    index: int, count: int, battery: BatteryStatus | None) -> Image.Image:
+                    index: int, count: int, battery: BatteryStatus | None,
+                    bluetooth: bool = False) -> Image.Image:
         image, draw = self._canvas()
         self._header(draw, f"{index + 1}/{count}" if count else "Nothing playing",
-                     battery, f"vol {volume}%")
+                     battery, f"vol {volume}%", bluetooth)
         if info is None:
             draw.text((SIZE // 2, 120), "Press Y to browse", font=self.text, fill=DIM, anchor="mm")
             return image
@@ -126,12 +240,12 @@ class Renderer:
             draw.text((SIZE // 2, art_y + ART // 2), "♪", font=self.note, fill=DIM, anchor="mm")
 
         y = art_y + ART + 6
-        draw.text((SIZE // 2, y), _fit(draw, info.title, self.bold, SIZE - 12),
+        draw.text((SIZE // 2, y), _fit(info.title, self.bold, SIZE - 12),
                   font=self.bold, fill=FG, anchor="mt")
         for line in (info.artist, info.album):
             y += 22
             if line:
-                draw.text((SIZE // 2, y), _fit(draw, line, self.text, SIZE - 12),
+                draw.text((SIZE // 2, y), _fit(line, self.text, SIZE - 12),
                           font=self.text, fill=DIM, anchor="mt")
 
         bar_y = 212

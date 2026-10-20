@@ -2,9 +2,11 @@
 
 # music_dir = "~/Music"
 # volume = 50                # starting volume when there's no saved state
+# bluetooth_volume = 50      # the same for Bluetooth headphones, which keep their own volume
 # backlight_timeout = 30     # seconds; 0 keeps the screen on (uses more battery)
 # rotation = 90
 # y_pin = 24                 # set to 20 for early Pirate Audio boards
 # battery = "auto"           # auto | waveshare | pisugar | none
 # low_battery_percent = 5
 # audio_device = ""          # passed to mpv --audio-device, e.g. "alsa/hw:0"; see mpv --audio-device=help
+# bluetooth = true           # false hides the Bluetooth menu

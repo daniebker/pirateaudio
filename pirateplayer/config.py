@@ -14,12 +14,14 @@ class Config:
         default_factory=lambda: Path.home() / ".local" / "state" / "pirateplayer" / "state.json"
     )
     volume: int = 50                 # starting volume (percent) if no saved state
+    bluetooth_volume: int = 50       # the same for Bluetooth headphones, which keep their own
     backlight_timeout: float = 30.0  # seconds of inactivity before the screen turns off; 0 = never
     rotation: int = 90               # display rotation; 90 suits the Pirate Audio layout
     y_pin: int = 24                  # early Pirate Audio boards wired button Y to GPIO 20
     battery: str = "auto"            # auto | waveshare | pisugar | none
     low_battery_percent: float = 5.0 # power off below this when not on external power
     audio_device: str = ""           # mpv --audio-device; empty = default
+    bluetooth: bool = True           # offer Bluetooth headsets, if the Pi has Bluetooth
 
 
 def load(path: Path = CONFIG_PATH) -> Config:

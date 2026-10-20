@@ -10,9 +10,11 @@ CONFIG_TXT=/boot/firmware/config.txt
 
 echo "==> Installing packages"
 sudo apt-get update
-sudo apt-get install -y --no-install-recommends mpv umtp-responder
+sudo apt-get install -y --no-install-recommends mpv umtp-responder \
+    bluez bluez-alsa-utils libasound2-plugin-bluez rfkill
 sudo apt-get install -y python3-venv python3-pil python3-mutagen python3-numpy \
-    python3-gpiozero python3-lgpio python3-libgpiod python3-spidev python3-smbus2 fonts-dejavu-core
+    python3-gpiozero python3-lgpio python3-libgpiod python3-spidev python3-smbus2 fonts-dejavu-core \
+    python3-dbus python3-gi
 
 echo "==> Creating virtualenv"
 python3 -m venv --system-site-packages "$HERE/.venv"
@@ -46,6 +48,20 @@ sudo chmod 440 /etc/sudoers.d/pirateplayer
 sudo visudo -cf /etc/sudoers.d/pirateplayer
 
 mkdir -p "$HOME/Music"
+
+echo "==> Configuring Bluetooth headsets"
+# Raspberry Pi OS starts with the radio blocked; systemd-rfkill remembers the unblock.
+sudo rfkill unblock bluetooth
+# bluez-alsa turns a connected headset into an ALSA device for mpv. The Pi only sends audio
+# (a2dp-source); by default it would also offer itself as a speaker for phones.
+sudo mkdir -p /etc/systemd/system/bluealsa.service.d
+sudo tee /etc/systemd/system/bluealsa.service.d/pirateplayer.conf >/dev/null <<EOF
+[Service]
+ExecStart=
+ExecStart=/usr/bin/bluealsa -S -p a2dp-source
+EOF
+# bluealsa-aplay plays audio that phones send, which we don't accept.
+sudo systemctl disable --now bluealsa-aplay.service 2>/dev/null || true
 
 echo "==> Configuring the USB music drive (MTP)"
 # Plugged into a computer through the USB data port, the Pi shows up as a media player
@@ -94,7 +110,7 @@ echo "==> Installing systemd service"
 sudo tee /etc/systemd/system/pirateplayer.service >/dev/null <<EOF
 [Unit]
 Description=Pirate Audio MP3 player
-After=local-fs.target sound.target
+After=local-fs.target sound.target bluetooth.service bluealsa.service
 
 [Service]
 User=$RUN_USER
@@ -122,7 +138,8 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 sudo systemctl daemon-reload
-sudo systemctl enable pirateplayer.service pirateplayer-mtp.service
+sudo systemctl enable pirateplayer.service pirateplayer-mtp.service bluetooth.service \
+    bluealsa.service
 
 echo
 echo "Done. Reboot to apply the hardware settings: sudo reboot"

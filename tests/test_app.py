@@ -1,14 +1,18 @@
 import json
+from dataclasses import replace
 
 import pytest
 
 from pirateplayer import app as app_module
 from pirateplayer import buttons as btn
-from pirateplayer.app import BROWSER, LOW_BATTERY_READINGS, NOW_PLAYING, VOLUME_STEP, App
+from pirateplayer.app import (BLUETOOTH, BLUETOOTH_ENTRY, BROWSER, FILES_ENTRY,
+                              LOW_BATTERY_READINGS, MENU, MESSAGE_TIME, NOW_PLAYING, SCAN_TIME,
+                              VOLUME_STEP, App)
 from pirateplayer.battery import BatteryStatus
+from pirateplayer.bluetooth import CONNECTING, audio_device
 from pirateplayer.player import PAUSED, PLAYING, STOPPED
 
-from .conftest import FakeButtons, FakeDisplay, FakePlayer
+from .conftest import HEADSET, SPEAKER, FakeBluetooth, FakeButtons, FakeDisplay, FakePlayer
 
 
 class FakeBattery:
@@ -25,9 +29,13 @@ class FakeBattery:
 def make_app(cfg, monkeypatch):
     monkeypatch.setattr(app_module.time, "sleep", lambda s: None)
 
-    def make(battery=None):
-        a = App(cfg, FakeDisplay(), FakeButtons(), battery, FakePlayer(), simulate=True)
+    def make(battery=None, bluetooth=None, files=True):
+        """`files` opens Files from the menu, unless the app resumed into now playing."""
+        a = App(cfg, FakeDisplay(), FakeButtons(), battery, FakePlayer(), simulate=True,
+                bluetooth=bluetooth)
         a.start()
+        if files and a.screen == MENU:
+            a.on_button("X", btn.TAP, 0.5)
         return a
     return make
 
@@ -45,7 +53,15 @@ def tap(app, name, now=1.0):
     app.on_button(name, btn.TAP, now)
 
 
-def test_starts_in_browser(app, music):
+def test_starts_at_menu(make_app):
+    a = make_app(files=False)
+    assert a.screen == MENU
+    assert a.menu == [FILES_ENTRY]  # no Bluetooth row without Bluetooth
+    a.on_button("X", btn.TAP, 1.0)
+    assert a.screen == BROWSER
+
+
+def test_files_lists_the_music_folder(app, music):
     assert app.screen == BROWSER
     assert names(app.entries) == ["Album 1", "Album 2", "loose.wav"]
     assert app.player.volume == 50
@@ -93,16 +109,36 @@ def test_hold_x_plays_folder_recursively(app):
     assert names(app.playlist) == ["a.wav"]
 
 
-def test_y_at_top_goes_to_now_playing_only_with_playlist(app):
+def test_y_goes_back_up_to_the_menu(app, music):
+    tap(app, "X")  # into Album 1
     tap(app, "Y")
+    assert app.screen == BROWSER and app.cwd == music
+    tap(app, "Y")
+    assert app.screen == MENU
+    assert app.menu[app.menu_cursor] is FILES_ENTRY
+    tap(app, "X")  # Files again starts at the top of the music folder
+    assert app.screen == BROWSER and app.cwd == music and app.cursor == 0
+
+
+def test_now_playing_from_menu_and_browser_only_with_playlist(app):
+    app.on_button("Y", btn.HOLD, 1.0)
     assert app.screen == BROWSER
-    app.on_button("X", btn.HOLD, 1.0)
+    tap(app, "Y")
+    tap(app, "Y")
+    assert app.screen == MENU  # nothing to go to
+    tap(app, "X")
+    app.on_button("X", btn.HOLD, 1.0)  # play Album 1
     tap(app, "Y")
     assert app.screen == BROWSER
     assert app.cwd.name == "Album 1"
     assert app.cursor == 0
-    tap(app, "Y")
     app.on_button("Y", btn.HOLD, 1.0)
+    assert app.screen == NOW_PLAYING
+    tap(app, "Y")
+    tap(app, "Y")
+    tap(app, "Y")
+    assert app.screen == MENU
+    tap(app, "Y")
     assert app.screen == NOW_PLAYING
 
 
@@ -262,11 +298,182 @@ def test_restore_skips_deleted_tracks(app, cfg, make_app, music):
 def test_restore_ignores_bad_state(cfg, make_app):
     cfg.state_file.parent.mkdir(parents=True)
     cfg.state_file.write_text("{not json")
-    a = make_app()
-    assert a.screen == BROWSER
+    a = make_app(files=False)
+    assert a.screen == MENU
     assert a.playlist == []
 
 
 def test_open_dir_outside_root_goes_to_root(app, music, tmp_path):
     app.open_dir(tmp_path)
     assert app.cwd == music
+
+
+# ---- bluetooth ----------------------------------------------------------------
+
+
+@pytest.fixture
+def bt_app(make_app):
+    return make_app(bluetooth=FakeBluetooth([HEADSET, SPEAKER]), files=False)
+
+
+def open_bluetooth_screen(app):
+    tap(app, "B")  # Bluetooth, the menu's second row
+    tap(app, "X")
+
+
+def test_menu_has_bluetooth_with_bluetooth(bt_app):
+    assert bt_app.menu == [FILES_ENTRY, BLUETOOTH_ENTRY]
+    tap(bt_app, "A")  # wraps
+    assert bt_app.menu[bt_app.menu_cursor] is BLUETOOTH_ENTRY
+
+
+def test_opening_bluetooth_scans_and_leaving_stops(bt_app):
+    open_bluetooth_screen(bt_app)
+    assert bt_app.screen == BLUETOOTH
+    assert bt_app.bluetooth.scanning
+    assert bt_app.bt_selected is None
+    tap(bt_app, "Y")
+    assert bt_app.screen == MENU
+    assert not bt_app.bluetooth.scanning
+    assert bt_app.menu[bt_app.menu_cursor] is BLUETOOTH_ENTRY
+
+
+def test_menu_shows_the_connected_headset(bt_app):
+    assert bt_app.headset_name() == ""
+    bt_app.on_bluetooth_event("audio", HEADSET.address)
+    assert bt_app.headset_name() == "Headset"
+
+
+def test_scan_row_toggles_scanning(bt_app):
+    open_bluetooth_screen(bt_app)
+    tap(bt_app, "X")
+    assert not bt_app.bluetooth.scanning
+    tap(bt_app, "X", now=50.0)
+    assert bt_app.bluetooth.scanning
+    assert bt_app.scan_until == 50.0 + SCAN_TIME
+
+
+def test_scan_stops_after_scan_time(bt_app):
+    open_bluetooth_screen(bt_app)
+    bt_app.tick(1.0 + SCAN_TIME - 1)
+    assert bt_app.bluetooth.scanning
+    bt_app.tick(1.0 + SCAN_TIME)
+    assert not bt_app.bluetooth.scanning
+
+
+def test_select_device_connects_or_disconnects(bt_app):
+    open_bluetooth_screen(bt_app)
+    tap(bt_app, "B")  # Headset (paired, so listed first)
+    assert bt_app.bt_selected == HEADSET.address
+    tap(bt_app, "X")
+    assert bt_app.bluetooth.calls[-1] == ("connect", HEADSET.address, False)
+
+    tap(bt_app, "B")  # Speaker, not paired: connect pairs first
+    tap(bt_app, "X")
+    assert bt_app.bluetooth.calls[-1] == ("connect", SPEAKER.address, False)
+
+    bt_app.bluetooth.list = [replace(HEADSET, connected=True), replace(SPEAKER, busy=CONNECTING)]
+    calls = len(bt_app.bluetooth.calls)
+    tap(bt_app, "X")  # busy: ignored
+    assert len(bt_app.bluetooth.calls) == calls
+    tap(bt_app, "A")
+    tap(bt_app, "X")
+    assert bt_app.bluetooth.calls[-1] == ("disconnect", HEADSET.address)
+
+
+def test_cursor_follows_the_device_when_the_list_reorders(bt_app):
+    open_bluetooth_screen(bt_app)
+    tap(bt_app, "B")
+    tap(bt_app, "B")  # Speaker, row 2
+    assert bt_app.bt_cursor(bt_app.bluetooth.devices()) == 2
+    bt_app.bluetooth.list = [HEADSET, replace(SPEAKER, paired=True, connected=True)]
+    assert bt_app.bt_cursor(bt_app.bluetooth.devices()) == 1
+    bt_app.bluetooth.list = [HEADSET]  # it went away: back to the scan row
+    assert bt_app.bt_cursor(bt_app.bluetooth.devices()) == 0
+
+
+def test_hold_x_forgets_paired_device(bt_app):
+    bt_app.bt_last = HEADSET.address
+    open_bluetooth_screen(bt_app)
+    tap(bt_app, "B")
+    bt_app.on_button("X", btn.HOLD, 1.0)
+    assert bt_app.bluetooth.calls[-1] == ("forget", HEADSET.address)
+    assert bt_app.bt_last is None
+    assert "Forgot Headset" in bt_app.bt_message
+    tap(bt_app, "B")  # Speaker isn't paired: nothing to forget
+    bt_app.on_button("X", btn.HOLD, 1.0)
+    assert bt_app.bluetooth.calls[-1] == ("forget", HEADSET.address)
+
+
+def test_headset_connecting_switches_audio_and_is_remembered(bt_app, cfg):
+    bt_app.bluetooth.events.put(("audio", HEADSET.address))
+    bt_app.tick(1.0)
+    assert bt_app.player.audio_device == audio_device(HEADSET.address)
+    assert bt_app.bt_audio == HEADSET.address
+    assert json.loads(cfg.state_file.read_text())["bluetooth"] == HEADSET.address
+
+
+def test_headset_going_away_pauses_and_returns_to_speaker(bt_app, cfg):
+    cfg.audio_device = "alsa/hw:0"
+    tap(bt_app, "X")  # Files
+    bt_app.on_button("X", btn.HOLD, 1.0)  # play Album 1
+    bt_app.on_bluetooth_event("audio", HEADSET.address)
+    assert bt_app.player.state == PLAYING
+    bt_app.on_bluetooth_event("audio", None)
+    assert bt_app.player.state == PAUSED
+    bt_app.on_bluetooth_event("audio", HEADSET.address)
+    bt_app.on_bluetooth_event("audio", None)
+    assert bt_app.player.state == PAUSED  # already paused: stays paused
+    assert bt_app.player.audio_device == "alsa/hw:0"
+    assert bt_app.bt_audio is None
+    assert bt_app.bt_last == HEADSET.address  # still the one to reconnect to
+
+
+def test_reconnects_to_last_headset_on_start(bt_app, make_app):
+    bt_app.on_bluetooth_event("audio", HEADSET.address)
+    restarted = make_app(bluetooth=FakeBluetooth([HEADSET]))
+    assert ("connect", HEADSET.address, True) in restarted.bluetooth.calls
+    without = make_app()  # Bluetooth turned off in the config...
+    without.save_state()
+    assert make_app().bt_last == HEADSET.address  # ...doesn't lose the headset
+
+
+def test_error_message_shows_then_expires(bt_app):
+    open_bluetooth_screen(bt_app)
+    bt_app.bluetooth.events.put(("error", "Couldn't connect to Speaker:\nnot in range"))
+    bt_app.tick(2.0)
+    assert bt_app.bt_message.startswith("Couldn't connect")
+    bt_app.tick(2.0 + MESSAGE_TIME)
+    assert bt_app.bt_message == ""
+
+
+def test_renders_every_screen_with_bluetooth(bt_app):
+    open_bluetooth_screen(bt_app)
+    bt_app.dirty = True
+    bt_app.tick(2.0)
+    bt_app.on_bluetooth_event("audio", HEADSET.address)
+    tap(bt_app, "Y")
+    bt_app.on_button("X", btn.HOLD, 3.0)
+    bt_app.tick(4.0)
+    assert len(bt_app.display.images) == 2
+
+
+def test_headphones_and_speaker_keep_their_own_volume(bt_app, cfg, make_app):
+    tap(bt_app, "X")  # Files
+    bt_app.on_button("X", btn.HOLD, 1.0)  # now playing: A/B change the volume
+    tap(bt_app, "B")
+    assert bt_app.volume == bt_app.player.volume == 50 - VOLUME_STEP
+    bt_app.on_bluetooth_event("audio", HEADSET.address)
+    assert bt_app.volume == bt_app.player.volume == cfg.bluetooth_volume
+    tap(bt_app, "A")
+    tap(bt_app, "A")
+    assert bt_app.player.volume == cfg.bluetooth_volume + 2 * VOLUME_STEP
+    bt_app.on_bluetooth_event("audio", None)
+    assert bt_app.volume == bt_app.player.volume == 50 - VOLUME_STEP
+
+    saved = json.loads(cfg.state_file.read_text())
+    assert saved["volume"] == 50 - VOLUME_STEP
+    assert saved["bluetooth_volume"] == cfg.bluetooth_volume + 2 * VOLUME_STEP
+    restored = make_app(bluetooth=FakeBluetooth())
+    restored.on_bluetooth_event("audio", HEADSET.address)
+    assert restored.player.volume == cfg.bluetooth_volume + 2 * VOLUME_STEP
