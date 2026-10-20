@@ -11,7 +11,7 @@ It plays MP3, FLAC and WAV files from `~/Music`, organised in folders however yo
 - Plug it into a computer and `~/Music` shows up as a drive (MTP), so you can copy music on without the network
 - Plays through Bluetooth headphones or speakers: scan, pair and connect from the player itself
 
-**Contents:** [Hardware](#hardware) · [Installation](#installation) · [Adding music](#adding-music) · [Buttons](#buttons) · [Bluetooth headphones](#bluetooth-headphones) · [Battery](#battery) · [Configuration](#configuration) · [Updating](#updating) · [Troubleshooting](#troubleshooting) · [Desktop simulator](#desktop-simulator) · [Tests](#tests)
+**Contents:** [Hardware](#hardware) · [Installation](#installation) · [Adding music](#adding-music) · [Buttons](#buttons) · [Bluetooth headphones](#bluetooth-headphones) · [Battery](#battery) · [Configuration](#configuration) · [Updating](#updating) · [Troubleshooting](#troubleshooting) · [Desktop simulator](#desktop-simulator) · [Tests](#tests) · [License](#license)
 
 ## Hardware
 
@@ -299,3 +299,7 @@ python3 -m venv .venv
 ```
 
 GitHub Actions runs them on every push and pull request.
+
+## License
+
+[MIT](LICENSE)
