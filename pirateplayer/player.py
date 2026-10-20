@@ -1,0 +1,135 @@
+"""Audio playback by driving mpv over its JSON IPC socket."""
+
+import json
+import logging
+import queue
+import shutil
+import socket
+import subprocess
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+log = logging.getLogger(__name__)
+
+STOPPED, PAUSED, PLAYING = "stopped", "paused", "playing"
+
+_POSITION_REQUEST = 1  # request_id used for time-pos queries
+_PAUSE_OBSERVER = 1
+
+
+class Player:
+    def __init__(self, device: str = ""):
+        self._dir = tempfile.mkdtemp(prefix="pirateplayer-")
+        sock_path = f"{self._dir}/mpv.sock"
+        # No scripts or key bindings: this mpv is headless, and RAM is tight on a Pi Zero.
+        cmd = ["mpv", "--no-config", "--idle=yes", "--no-video", "--no-terminal",
+               "--audio-display=no", "--load-scripts=no", "--osc=no", "--ytdl=no",
+               "--input-default-bindings=no", f"--input-ipc-server={sock_path}"]
+        if device:
+            cmd.append(f"--audio-device={device}")
+        self._proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL)
+        try:
+            self._sock = self._connect(sock_path)
+        except RuntimeError:
+            self._proc.kill()
+            shutil.rmtree(self._dir, ignore_errors=True)
+            raise
+        self._file = self._sock.makefile("r", encoding="utf-8", errors="replace")
+
+        # Events for the main loop: ("ended", None), ("error", message), ("died", None)
+        self.events: queue.Queue = queue.Queue()
+        self.state = STOPPED
+        self.position = 0.0
+        # Between our loadfile and mpv's start-file, any end-file belongs to the old track.
+        self._loading = False
+        threading.Thread(target=self._read_output, daemon=True).start()
+        self._send("observe_property", _PAUSE_OBSERVER, "pause")
+
+    def _connect(self, path: str) -> socket.socket:
+        deadline = time.monotonic() + 60  # mpv takes 7s or more to start on a Pi Zero
+        while True:
+            try:
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.connect(path)
+                return sock
+            except OSError:
+                sock.close()
+                if self._proc.poll() is not None or time.monotonic() > deadline:
+                    raise RuntimeError("could not start mpv")
+                time.sleep(0.1)
+
+    def _send(self, *command, request_id: int | None = None):
+        message = {"command": list(command)}
+        if request_id is not None:
+            message["request_id"] = request_id
+        try:
+            self._sock.sendall((json.dumps(message) + "\n").encode())
+        except OSError:
+            log.error("mpv is not running")
+
+    def _read_output(self):
+        for line in self._file:
+            try:
+                self._handle(json.loads(line))
+            except ValueError:
+                pass
+        self.events.put(("died", None))
+
+    def _handle(self, msg: dict):
+        event = msg.get("event")
+        if msg.get("request_id") == _POSITION_REQUEST:
+            if isinstance(msg.get("data"), (int, float)):
+                self.position = msg["data"]
+        elif event == "start-file":
+            self._loading = False
+        elif event == "end-file" and not self._loading:
+            reason = msg.get("reason")
+            if reason == "eof":
+                self.state = STOPPED
+                self.events.put(("ended", None))
+            elif reason == "error":
+                self.state = STOPPED
+                self.events.put(("error", msg.get("file_error", "unknown error")))
+        elif event == "property-change" and msg.get("name") == "pause":
+            if self.state != STOPPED:
+                self.state = PAUSED if msg.get("data") else PLAYING
+
+    def load(self, path: Path, start: float = 0.0, paused: bool = False):
+        self._loading = True
+        self.position = start
+        self.state = PAUSED if paused else PLAYING
+        # Options set now apply to the next file mpv loads.
+        self._send("set_property", "start", f"{start:.1f}")
+        self._send("set_property", "pause", paused)
+        self._send("loadfile", str(path), "replace")
+
+    def toggle_pause(self):
+        if self.state != STOPPED:
+            self._send("cycle", "pause")
+
+    def stop(self):
+        self.state = STOPPED
+        self._send("stop")
+
+    def seek(self, seconds: float):
+        self.position = max(0.0, seconds)
+        self._send("seek", self.position, "absolute")
+
+    def set_volume(self, percent: int):
+        self._send("set_property", "volume", percent)
+
+    def poll_position(self):
+        if self.state != STOPPED:
+            self._send("get_property", "time-pos", request_id=_POSITION_REQUEST)
+
+    def close(self):
+        self._send("quit")
+        try:
+            self._proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+        self._sock.close()
+        shutil.rmtree(self._dir, ignore_errors=True)
