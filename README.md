@@ -153,7 +153,7 @@ The Pi appears as a media player called "Pirate Audio Player" with two drives: `
 - Music added on the Pi while it's plugged in won't show on the computer until you reconnect: the Pi doesn't send change notifications, because the umtprd version in Debian hangs when it does.
 - Gadget mode means the USB port can't be used for a keyboard or other USB device.
 - Edit smart playlists on the `Playlists` drive like any text file. If your computer won't open a `.txt` file in place, copy it off, edit it, and copy it back. The player picks up changes the next time you open **Playlists**.
-- If you delete `~/playlists`, it comes back empty the next time the drive starts. Re-running the installer won't restore the example playlists.
+- If you delete `~/playlists`, it comes back empty the next time the drive starts. To get the examples back, copy them from `~/pirateplayer/playlists`.
 - To turn the drive off: `sudo systemctl disable --now pirateplayer-mtp`.
 
 ### Copying music over the network
