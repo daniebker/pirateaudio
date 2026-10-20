@@ -10,9 +10,11 @@ from pathlib import Path
 from . import buttons as btn
 from .bluetooth import audio_device
 from .config import Config
+from .database import Indexer, open_database
 from .library import TrackInfo, is_track, list_dir, read_info, tracks_in
 from .player import PLAYING, STOPPED, Player
-from .ui import MenuEntry, Renderer
+from .playlists import SmartPlaylist, load_all
+from .ui import DIM, GOOD, LOW, MenuEntry, Renderer, Row
 
 log = logging.getLogger(__name__)
 
@@ -23,11 +25,19 @@ LOW_BATTERY_READINGS = 3  # consecutive low readings before powering off
 VOLUME_STEP = 5
 RESTART_THRESHOLD = 3.0   # "previous" restarts the track if we're further in than this
 SCAN_TIME = 30.0          # seconds a Bluetooth scan runs for
-MESSAGE_TIME = 5.0        # seconds a Bluetooth message stays up
+MESSAGE_TIME = 5.0        # seconds a message stays up
+# A track counts as played once it has played for half its length or 4 minutes, whichever is
+# sooner (the rule Last.fm uses), or when it plays to the end.
+PLAY_FRACTION = 0.5
+PLAY_MAX = 240.0
 
 MENU, BROWSER, NOW_PLAYING, BLUETOOTH = "menu", "browser", "now_playing", "bluetooth"
+PLAYLISTS, SETTINGS = "playlists", "settings"
 FILES_ENTRY = MenuEntry("Files", "folder")
+PLAYLISTS_ENTRY = MenuEntry("Playlists", "playlist")
 BLUETOOTH_ENTRY = MenuEntry("Bluetooth", "bluetooth")
+SETTINGS_ENTRY = MenuEntry("Settings", "settings")
+SYNC_ROW = 0  # rows of the settings screen
 
 
 def move_cursor(cursor: int, count: int, step: int, kind: str) -> int:
@@ -49,8 +59,17 @@ class App:
         self.bluetooth = bluetooth
         self.ui = Renderer()
 
+        self.db = open_database(cfg.database)
+        self.indexer = Indexer(self.db, cfg.music_dir) if self.db else None
+        self.syncs_seen = 0  # the indexer's count of finished syncs, when we last looked
+
         self.screen = MENU
-        self.menu = [FILES_ENTRY, BLUETOOTH_ENTRY] if bluetooth else [FILES_ENTRY]
+        self.menu = [FILES_ENTRY]
+        if self.db:
+            self.menu.append(PLAYLISTS_ENTRY)
+        if bluetooth:
+            self.menu.append(BLUETOOTH_ENTRY)
+        self.menu.append(SETTINGS_ENTRY)
         self.menu_cursor = 0
         self.root = cfg.music_dir
         self.cwd = self.root
@@ -60,14 +79,20 @@ class App:
         self.bt_selected: str | None = None  # address of the selected device; None = the scan row
         self.bt_audio: str | None = None     # address of the headset we're playing to
         self.bt_last: str | None = None      # the last headset played to, to reconnect at startup
-        self.bt_message = ""
-        self.bt_message_until = 0.0
         self.scan_until = 0.0
+        self.message = ""
+        self.message_until = 0.0
+
+        self.playlists: list[SmartPlaylist] = []
+        self.playlist_cursor = 0
+        self.settings_cursor = 0
 
         self.playlist: list[Path] = []
         self.index = 0
         self.info: TrackInfo | None = None
         self.failures = 0  # consecutive tracks that failed to play
+        self.listened = 0.0   # seconds the current track has played for
+        self.counted = False  # whether this play of the current track has been counted
         self.speaker_volume = cfg.volume
         self.bluetooth_volume = cfg.bluetooth_volume
 
@@ -77,6 +102,7 @@ class App:
         self.dirty = True
         self.running = True
         self.last_input = self.last_battery = self.last_save = self.last_poll = 0.0
+        self.last_tick = 0.0
         self.now = 0.0  # the time of the tick or button press being handled
 
     @property
@@ -96,7 +122,9 @@ class App:
     def start(self):
         self.display.set_backlight(True)
         self.restore_state()
-        self.now = self.last_input = time.monotonic()
+        self.now = self.last_input = self.last_tick = time.monotonic()
+        if self.indexer:
+            self.indexer.start()  # in the background: it takes minutes for a big library
         if self.bluetooth and self.bt_last:
             # Most headsets connect back by themselves when switched on, but not all.
             self.bluetooth.connect(self.bt_last, quiet=True)
@@ -113,8 +141,15 @@ class App:
         finally:
             self.save_state()
 
+    def close(self):
+        if self.indexer:
+            self.indexer.stop()
+        if self.db:
+            self.db.close()
+
     def tick(self, now: float):
         self.now = now
+        self.tick_listening(now)
         for name, kind in self.buttons.poll():
             self.on_button(name, kind, now)
 
@@ -123,6 +158,11 @@ class App:
 
         if self.bluetooth:
             self.tick_bluetooth(now)
+        if self.indexer:
+            self.tick_indexer(now)
+        if self.message and now >= self.message_until:
+            self.message = ""
+            self.dirty = True
 
         if now - self.last_battery >= BATTERY_INTERVAL:
             self.last_battery = now
@@ -149,7 +189,8 @@ class App:
     def render(self):
         bt = self.bt_audio is not None
         if self.screen == MENU:
-            return self.ui.menu(self.menu, self.menu_cursor, {BLUETOOTH_ENTRY: self.headset_name()},
+            status = {BLUETOOTH_ENTRY: self.headset_name(), SETTINGS_ENTRY: self.sync_status()}
+            return self.ui.menu(self.menu, self.menu_cursor, status,
                                 self.battery_status, self.player.state == PLAYING, bt)
         if self.screen == BROWSER:
             title = "Music" if self.cwd == self.root else self.cwd.name
@@ -158,8 +199,19 @@ class App:
         if self.screen == BLUETOOTH:
             devices = self.bluetooth.devices()
             return self.ui.bluetooth(devices, self.bt_cursor(devices), self.bluetooth.scanning,
-                                     max(0.0, self.scan_until - self.now), self.bt_message,
+                                     max(0.0, self.scan_until - self.now), self.message,
                                      self.battery_status)
+        if self.screen == PLAYLISTS:
+            rows = [Row(pl.name, "Has errors" if pl.problems else "", status_colour=LOW)
+                    for pl in self.playlists]
+            return self.ui.list_screen("Playlists", rows, self.playlist_cursor,
+                                       self.battery_status, self.player.state == PLAYING, bt,
+                                       empty="No playlists.\nAdd them to the\nplaylists folder.",
+                                       message=self.message)
+        if self.screen == SETTINGS:
+            return self.ui.list_screen("Settings", self.settings_rows(), self.settings_cursor,
+                                       self.battery_status, self.player.state == PLAYING, bt,
+                                       message=self.message)
         return self.ui.now_playing(self.info, self.player.state, self.player.position, self.volume,
                                    self.index, len(self.playlist), self.battery_status, bt)
 
@@ -182,6 +234,10 @@ class App:
             self.browser_button(name, kind)
         elif self.screen == BLUETOOTH:
             self.bluetooth_button(name, kind)
+        elif self.screen == PLAYLISTS:
+            self.playlists_button(name, kind)
+        elif self.screen == SETTINGS:
+            self.settings_button(name, kind)
         else:
             self.now_playing_button(name, kind)
         self.dirty = True
@@ -191,9 +247,15 @@ class App:
             self.menu_cursor = move_cursor(self.menu_cursor, len(self.menu),
                                            -1 if name == "A" else 1, kind)
         elif name == "X" and kind != btn.REPEAT:
-            if self.menu[self.menu_cursor] is FILES_ENTRY:
+            entry = self.menu[self.menu_cursor]
+            if entry is FILES_ENTRY:
                 self.screen = BROWSER
                 self.open_dir(self.root)
+            elif entry is PLAYLISTS_ENTRY:
+                self.open_playlists()
+            elif entry is SETTINGS_ENTRY:
+                self.screen = SETTINGS
+                self.settings_cursor = 0
             else:
                 self.open_bluetooth()
         elif name == "Y" and kind != btn.REPEAT and self.playlist:
@@ -244,6 +306,7 @@ class App:
         elif name == "Y" and kind == btn.HOLD:
             if self.player.position > RESTART_THRESHOLD:
                 self.player.seek(0)
+                self.listened, self.counted = 0.0, False  # listening again is another play
             else:
                 self.skip(-1)
 
@@ -253,6 +316,81 @@ class App:
         self.cwd = directory
         self.entries = list_dir(directory)
         self.cursor = self.entries.index(select) if select in self.entries else 0
+
+    # ---- playlists -----------------------------------------------------------
+
+    def open_playlists(self):
+        # Read afresh each time, so edits show up without restarting.
+        self.playlists = load_all(self.cfg.playlists_dir)
+        self.playlist_cursor = min(self.playlist_cursor, max(0, len(self.playlists) - 1))
+        self.screen = PLAYLISTS
+
+    def playlists_button(self, name: str, kind: str):
+        if name in ("A", "B") and self.playlists:
+            self.playlist_cursor = move_cursor(self.playlist_cursor, len(self.playlists),
+                                               -1 if name == "A" else 1, kind)
+        elif name == "X" and kind != btn.REPEAT and self.playlists:
+            self.play_playlist(self.playlists[self.playlist_cursor])
+        elif name == "Y" and kind == btn.TAP:
+            self.open_menu(PLAYLISTS_ENTRY)
+        elif name == "Y" and kind == btn.HOLD and self.playlist:
+            self.screen = NOW_PLAYING
+
+    def play_playlist(self, pl: SmartPlaylist):
+        try:
+            indexed = self.db.tracks(pl.since())
+        except Exception as e:
+            log.error("Could not read the library for %s: %s", pl.name, e)
+            self.show_message("Couldn't read the library")
+            return
+        tracks = [p for p in pl.select(indexed, self.root) if is_track(p)]
+        if tracks:
+            log.info("Playing playlist %s: %d tracks", pl.name, len(tracks))
+            self.play(tracks, 0)
+        elif self.indexer.running:
+            self.show_message("Nothing yet:\nstill indexing your music")
+        else:
+            self.show_message(f"No tracks match\n{pl.name}")
+
+    # ---- settings ------------------------------------------------------------
+
+    def sync_status(self) -> str:
+        if self.indexer is None:
+            return "Unavailable"
+        if self.indexer.running:
+            return f"Syncing… {self.indexer.found}"
+        count = self.db.track_count()
+        return f"{count} track{'' if count == 1 else 's'}"
+
+    def settings_rows(self) -> list[Row]:
+        running = self.indexer is not None and self.indexer.running
+        return [Row("Sync library", self.sync_status(), status_colour=GOOD if running else DIM)]
+
+    def settings_button(self, name: str, kind: str):
+        rows = self.settings_rows()
+        if name in ("A", "B"):
+            self.settings_cursor = move_cursor(self.settings_cursor, len(rows),
+                                               -1 if name == "A" else 1, kind)
+        elif name == "X" and kind == btn.TAP and self.settings_cursor == SYNC_ROW:
+            if self.indexer is None:
+                self.show_message("The library database\ncouldn't be opened")
+            elif not self.indexer.start():
+                self.show_message("Already syncing")
+        elif name == "Y" and kind == btn.TAP:
+            self.open_menu(SETTINGS_ENTRY)
+        elif name == "Y" and kind == btn.HOLD and self.playlist:
+            self.screen = NOW_PLAYING
+
+    def tick_indexer(self, now: float):
+        if self.indexer.finished != self.syncs_seen:
+            self.syncs_seen = self.indexer.finished
+            self.dirty = True
+            if self.screen == SETTINGS:
+                self.show_message(f"Synced {self.indexer.last_count} tracks")
+        # Count the tracks found on screen.
+        if self.indexer.running and self.screen in (MENU, SETTINGS) and now - self.last_poll >= 1.0:
+            self.last_poll = now
+            self.dirty = True
 
     # ---- bluetooth ---------------------------------------------------------
 
@@ -307,9 +445,6 @@ class App:
             self.on_bluetooth_event(*self.bluetooth.events.get())
         if self.bluetooth.scanning and now >= self.scan_until:
             self.bluetooth.stop_scan()
-        if self.bt_message and now >= self.bt_message_until:
-            self.bt_message = ""
-            self.dirty = True
         # Count the scan down on screen.
         if self.screen == BLUETOOTH and self.bluetooth.scanning and now - self.last_poll >= 1.0:
             self.last_poll = now
@@ -348,8 +483,9 @@ class App:
         return ""
 
     def show_message(self, text: str):
-        self.bt_message = text
-        self.bt_message_until = self.now + MESSAGE_TIME
+        self.message = text
+        self.message_until = self.now + MESSAGE_TIME
+        self.dirty = True
 
     # ---- playback ----------------------------------------------------------
 
@@ -361,9 +497,11 @@ class App:
         self.screen = NOW_PLAYING
         self.start_track()
 
-    def start_track(self, start: float = 0.0, paused: bool = False):
+    def start_track(self, start: float = 0.0, paused: bool = False, listened: float = 0.0,
+                    counted: bool = False):
         path = self.playlist[self.index]
         self.info = read_info(path)
+        self.listened, self.counted = listened, counted
         self.player.set_volume(self.volume)
         self.player.load(path, start=start, paused=paused)
         self.save_state()
@@ -375,8 +513,33 @@ class App:
         self.index = (self.index + step) % len(self.playlist)
         self.start_track()
 
+    # ---- play counts ---------------------------------------------------------
+
+    def tick_listening(self, now: float):
+        """Add up how long the current track has played, and count it once it's played enough."""
+        elapsed, self.last_tick = now - self.last_tick, now
+        if self.player.state != PLAYING or self.counted:
+            return
+        # A long gap means we weren't running (suspended, or the clock jumped), not playing.
+        self.listened += min(max(0.0, elapsed), 1.0)
+        length = self.info.length if self.info else 0.0
+        if self.listened >= min(PLAY_MAX, length * PLAY_FRACTION if length else PLAY_MAX):
+            self.count_play()
+
+    def count_play(self):
+        if self.counted or not self.playlist:
+            return
+        self.counted = True
+        if self.db:
+            path = self.playlist[self.index]
+            try:
+                self.db.record_play(path)
+            except Exception as e:  # never let bookkeeping stop the music
+                log.warning("Could not record a play of %s: %s", path, e)
+
     def on_player_event(self, kind: str, detail):
         if kind == "ended":
+            self.count_play()
             self.failures = 0
             if self.index + 1 < len(self.playlist):
                 self.skip(1)
@@ -439,6 +602,8 @@ class App:
             "volume": self.speaker_volume,
             "bluetooth_volume": self.bluetooth_volume,
             "bluetooth": self.bt_last,
+            "listened": self.listened,
+            "counted": self.counted,
         }
         path = self.cfg.state_file
         try:
@@ -465,6 +630,8 @@ class App:
             self.playlist = [p for p in playlist if is_track(p)]
             self.index = self.playlist.index(playlist[index])
             # Resume paused: a player shouldn't start making noise just because it booted.
-            self.start_track(start=float(state.get("position", 0.0)), paused=True)
+            self.start_track(start=float(state.get("position", 0.0)), paused=True,
+                             listened=float(state.get("listened", 0.0)),
+                             counted=bool(state.get("counted", False)))
             self.screen = NOW_PLAYING
             self.open_dir(self.playlist[self.index].parent, select=self.playlist[self.index])

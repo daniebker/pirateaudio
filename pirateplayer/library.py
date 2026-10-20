@@ -51,9 +51,12 @@ class TrackInfo:
     album: str = ""
     length: float = 0.0
     art: Image.Image | None = None
+    genre: str = ""
+    year: str = ""
 
 
-def read_info(path: Path) -> TrackInfo:
+def read_info(path: Path, art: bool = True) -> TrackInfo:
+    """Tags, length and cover art. Without `art`, skips decoding the cover, which is slow."""
     info = TrackInfo(title=path.stem)
     try:
         import mutagen
@@ -66,7 +69,9 @@ def read_info(path: Path) -> TrackInfo:
     tags = {}
     if audio is not None:
         info.length = audio.info.length
-        tags, info.art = _tags_and_art(audio)
+        tags = _tags(audio)
+        if art:
+            info.art = _embedded_art(audio)
     if path.suffix.lower() == ".wav":
         # WAV files usually carry RIFF INFO tags, which mutagen doesn't read.
         tags = _riff_info(path) | {k: v for k, v in tags.items() if v}
@@ -74,15 +79,17 @@ def read_info(path: Path) -> TrackInfo:
     info.title = tags.get("title") or path.stem
     info.artist = tags.get("artist", "")
     info.album = tags.get("album", "")
-    if info.art is None:
+    info.genre = tags.get("genre", "")
+    info.year = tags.get("year", "")[:4]
+    if art and info.art is None:
         info.art = _folder_art(path.parent)
     return info
 
 
-def _tags_and_art(audio) -> tuple[dict[str, str], Image.Image | None]:
+def _tags(audio) -> dict[str, str]:
     from mutagen.id3 import ID3
 
-    tags, pictures = audio.tags, []
+    tags = audio.tags
     if isinstance(tags, ID3):  # MP3, and WAV files with an ID3 chunk
         def text(*frame_ids):
             for frame_id in frame_ids:
@@ -91,9 +98,9 @@ def _tags_and_art(audio) -> tuple[dict[str, str], Image.Image | None]:
                     return str(frame.text[0]).strip()
             return ""
 
-        found = {"title": text("TIT2"), "artist": text("TPE1", "TPE2"), "album": text("TALB")}
-        pictures = [tags[k].data for k in tags.keys() if k.startswith("APIC")]
-    elif tags is not None:  # Vorbis comments (FLAC)
+        return {"title": text("TIT2"), "artist": text("TPE1", "TPE2"), "album": text("TALB"),
+                "genre": text("TCON"), "year": text("TDRC", "TYER")}
+    if tags is not None:  # Vorbis comments (FLAC)
         def text(*keys):
             for key in keys:
                 values = tags.get(key)
@@ -101,20 +108,27 @@ def _tags_and_art(audio) -> tuple[dict[str, str], Image.Image | None]:
                     return str(values[0]).strip()
             return ""
 
-        found = {"title": text("title"), "artist": text("artist", "albumartist"),
-                 "album": text("album")}
-    else:
-        found = {}
+        return {"title": text("title"), "artist": text("artist", "albumartist"),
+                "album": text("album"), "genre": text("genre"), "year": text("date", "year")}
+    return {}
+
+
+def _embedded_art(audio) -> Image.Image | None:
+    from mutagen.id3 import ID3
+
+    pictures = []
+    if isinstance(audio.tags, ID3):
+        pictures = [audio.tags[k].data for k in audio.tags.keys() if k.startswith("APIC")]
     # FLAC keeps pictures outside the tags; prefer the front cover (type 3).
     flac_pictures = sorted(getattr(audio, "pictures", []), key=lambda p: p.type != 3)
     pictures += [p.data for p in flac_pictures]
 
     for data in pictures:
         try:
-            return found, Image.open(io.BytesIO(data)).convert("RGB")
+            return Image.open(io.BytesIO(data)).convert("RGB")
         except Exception:
             pass
-    return found, None
+    return None
 
 
 def _riff_info(path: Path) -> dict[str, str]:

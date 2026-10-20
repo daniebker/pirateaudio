@@ -49,6 +49,14 @@ sudo visudo -cf /etc/sudoers.d/pirateplayer
 
 mkdir -p "$HOME/Music"
 
+echo "==> Smart playlists"
+# Example playlists only go into a new folder, so ones you've deleted don't come back.
+if [ ! -d "$HOME/playlists" ]; then
+    mkdir -p "$HOME/playlists"
+    cp "$HERE"/playlists/*.txt "$HOME/playlists/"
+fi
+cp "$HERE/playlists/README.txt" "$HOME/playlists/README.txt"
+
 echo "==> Configuring Bluetooth headsets"
 # Raspberry Pi OS starts with the radio blocked; systemd-rfkill remembers the unblock.
 sudo rfkill unblock bluetooth
@@ -81,6 +89,7 @@ umask 022
 no_inotify 0x1
 
 storage "$HOME/Music" "Music" "rw"
+storage "$HOME/playlists" "Playlists" "rw"
 
 manufacturer "Raspberry Pi"
 product "Pirate Audio Player"
@@ -104,7 +113,7 @@ usb_max_packet_size 0x200
 EOF
 sudo install -m 755 "$HERE/scripts/mtp-gadget.sh" /usr/local/sbin/pirateplayer-mtp-gadget
 # Earlier versions ran umtprd as root, leaving root-only folders the player can't read.
-sudo chown -R "$RUN_USER:" "$HOME/Music"
+sudo chown -R "$RUN_USER:" "$HOME/Music" "$HOME/playlists"
 
 echo "==> Installing systemd service"
 sudo tee /etc/systemd/system/pirateplayer.service >/dev/null <<EOF

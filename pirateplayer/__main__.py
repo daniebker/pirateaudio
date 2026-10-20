@@ -55,6 +55,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        app.close()
         player.close()
         if bluetooth:
             bluetooth.close()

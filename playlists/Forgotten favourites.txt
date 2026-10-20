@@ -1,0 +1,5 @@
+# Tracks you've played a lot, but not for three months
+sort: random
+min plays: 3
+not played in: 3 months
+limit: 50

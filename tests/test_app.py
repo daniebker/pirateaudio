@@ -6,13 +6,15 @@ import pytest
 from pirateplayer import app as app_module
 from pirateplayer import buttons as btn
 from pirateplayer.app import (BLUETOOTH, BLUETOOTH_ENTRY, BROWSER, FILES_ENTRY,
-                              LOW_BATTERY_READINGS, MENU, MESSAGE_TIME, NOW_PLAYING, SCAN_TIME,
+                              LOW_BATTERY_READINGS, MENU, MESSAGE_TIME, NOW_PLAYING, PLAY_MAX,
+                              PLAYLISTS, PLAYLISTS_ENTRY, SCAN_TIME, SETTINGS, SETTINGS_ENTRY,
                               VOLUME_STEP, App)
 from pirateplayer.battery import BatteryStatus
 from pirateplayer.bluetooth import CONNECTING, audio_device
 from pirateplayer.player import PAUSED, PLAYING, STOPPED
 
-from .conftest import HEADSET, SPEAKER, FakeBluetooth, FakeButtons, FakeDisplay, FakePlayer
+from .conftest import (HEADSET, SPEAKER, FakeBluetooth, FakeButtons, FakeDisplay, FakePlayer,
+                       make_wav)
 
 
 class FakeBattery:
@@ -29,15 +31,21 @@ class FakeBattery:
 def make_app(cfg, monkeypatch):
     monkeypatch.setattr(app_module.time, "sleep", lambda s: None)
 
+    made = []
+
     def make(battery=None, bluetooth=None, files=True):
         """`files` opens Files from the menu, unless the app resumed into now playing."""
         a = App(cfg, FakeDisplay(), FakeButtons(), battery, FakePlayer(), simulate=True,
                 bluetooth=bluetooth)
         a.start()
+        a.indexer.join()  # index the test library before going on
+        made.append(a)
         if files and a.screen == MENU:
             a.on_button("X", btn.TAP, 0.5)
         return a
-    return make
+    yield make
+    for a in made:
+        a.close()
 
 
 @pytest.fixture
@@ -56,7 +64,7 @@ def tap(app, name, now=1.0):
 def test_starts_at_menu(make_app):
     a = make_app(files=False)
     assert a.screen == MENU
-    assert a.menu == [FILES_ENTRY]  # no Bluetooth row without Bluetooth
+    assert a.menu == [FILES_ENTRY, PLAYLISTS_ENTRY, SETTINGS_ENTRY]  # no Bluetooth row
     a.on_button("X", btn.TAP, 1.0)
     assert a.screen == BROWSER
 
@@ -317,14 +325,14 @@ def bt_app(make_app):
 
 
 def open_bluetooth_screen(app):
-    tap(app, "B")  # Bluetooth, the menu's second row
+    app.menu_cursor = app.menu.index(BLUETOOTH_ENTRY)
     tap(app, "X")
 
 
 def test_menu_has_bluetooth_with_bluetooth(bt_app):
-    assert bt_app.menu == [FILES_ENTRY, BLUETOOTH_ENTRY]
+    assert bt_app.menu == [FILES_ENTRY, PLAYLISTS_ENTRY, BLUETOOTH_ENTRY, SETTINGS_ENTRY]
     tap(bt_app, "A")  # wraps
-    assert bt_app.menu[bt_app.menu_cursor] is BLUETOOTH_ENTRY
+    assert bt_app.menu[bt_app.menu_cursor] is SETTINGS_ENTRY
 
 
 def test_opening_bluetooth_scans_and_leaving_stops(bt_app):
@@ -399,7 +407,7 @@ def test_hold_x_forgets_paired_device(bt_app):
     bt_app.on_button("X", btn.HOLD, 1.0)
     assert bt_app.bluetooth.calls[-1] == ("forget", HEADSET.address)
     assert bt_app.bt_last is None
-    assert "Forgot Headset" in bt_app.bt_message
+    assert "Forgot Headset" in bt_app.message
     tap(bt_app, "B")  # Speaker isn't paired: nothing to forget
     bt_app.on_button("X", btn.HOLD, 1.0)
     assert bt_app.bluetooth.calls[-1] == ("forget", HEADSET.address)
@@ -442,9 +450,9 @@ def test_error_message_shows_then_expires(bt_app):
     open_bluetooth_screen(bt_app)
     bt_app.bluetooth.events.put(("error", "Couldn't connect to Speaker:\nnot in range"))
     bt_app.tick(2.0)
-    assert bt_app.bt_message.startswith("Couldn't connect")
+    assert bt_app.message.startswith("Couldn't connect")
     bt_app.tick(2.0 + MESSAGE_TIME)
-    assert bt_app.bt_message == ""
+    assert bt_app.message == ""
 
 
 def test_renders_every_screen_with_bluetooth(bt_app):
@@ -477,3 +485,187 @@ def test_headphones_and_speaker_keep_their_own_volume(bt_app, cfg, make_app):
     restored = make_app(bluetooth=FakeBluetooth())
     restored.on_bluetooth_event("audio", HEADSET.address)
     assert restored.player.volume == cfg.bluetooth_volume + 2 * VOLUME_STEP
+
+
+# ---- library index and play counts ----------------------------------------------
+
+
+def test_indexes_the_library_at_startup(app):
+    assert app.db.track_count() == 5
+
+
+def play_for(app, seconds, start=10.0):
+    """Tick through `seconds` of playback, a second at a time."""
+    for t in range(int(seconds) + 1):
+        app.tick(start + t)
+
+
+def test_counts_a_play_after_half_the_track(app, music):
+    app.on_button("X", btn.HOLD, 1.0)  # Album 1, from its first track
+    track = app.playlist[0]
+    app.info.length = 100.0
+    app.last_tick = 10.0
+    play_for(app, 48)
+    assert app.db.play_count(track) == 0
+    play_for(app, 3, start=59.0)
+    assert app.db.play_count(track) == 1
+    play_for(app, 60, start=70.0)
+    assert app.db.play_count(track) == 1  # once per play
+
+
+def test_counts_long_tracks_after_four_minutes(app):
+    app.on_button("X", btn.HOLD, 1.0)
+    app.info.length = 3600.0
+    app.last_tick = 10.0
+    play_for(app, PLAY_MAX + 1)
+    assert app.db.play_count(app.playlist[0]) == 1
+
+
+def test_paused_time_and_gaps_dont_count(app):
+    app.on_button("X", btn.HOLD, 1.0)
+    app.info.length = 100.0
+    app.player.toggle_pause()
+    app.last_tick = 10.0
+    play_for(app, 100)
+    app.player.toggle_pause()
+    app.tick(10_000.0)  # a gap: the clock jumped
+    assert app.listened <= 1.0
+    assert app.db.play_count(app.playlist[0]) == 0
+
+
+def test_playing_to_the_end_counts_once(app):
+    app.on_button("X", btn.HOLD, 1.0)
+    first = app.playlist[0]
+    app.on_player_event("ended", None)
+    assert app.db.play_count(first) == 1
+    assert (app.index, app.listened, app.counted) == (1, 0.0, False)
+    app.info.length = 10.0
+    app.last_tick = 10.0
+    play_for(app, 6)
+    app.on_player_event("ended", None)
+    assert app.db.play_count(app.playlist[1]) == 1
+
+
+def test_restarting_a_track_is_another_play(app):
+    app.on_button("X", btn.HOLD, 1.0)
+    app.on_player_event("ended", None)
+    app.skip(-1)
+    app.counted = True
+    app.player.position = 10
+    app.on_button("Y", btn.HOLD, 1.0)
+    assert not app.counted
+
+
+def test_whether_a_play_was_counted_survives_restarts(app, make_app):
+    app.on_button("X", btn.HOLD, 1.0)
+    app.info.length = 100.0
+    app.last_tick = 10.0
+    play_for(app, 60)
+    app.save_state()
+    resumed = make_app()
+    assert resumed.counted and resumed.listened >= 50
+    resumed.on_player_event("ended", None)
+    assert resumed.db.play_count(app.playlist[0]) == 1
+
+
+# ---- settings ---------------------------------------------------------------------
+
+
+def open_entry(app, entry):
+    app.screen = MENU
+    app.menu_cursor = app.menu.index(entry)
+    tap(app, "X")
+
+
+def test_settings_syncs_the_library(app, music):
+    make_wav(music / "new.wav")
+    open_entry(app, SETTINGS_ENTRY)
+    assert app.screen == SETTINGS
+    assert app.settings_rows()[0].status == "5 tracks"
+    app.render()
+    tap(app, "X")
+    assert app.indexer.running or app.indexer.last_count == 6
+    app.indexer.join()
+    app.tick(5.0)
+    assert app.message == "Synced 6 tracks"
+    assert app.settings_rows()[0].status == "6 tracks"
+    app.render()
+    tap(app, "Y")
+    assert app.screen == MENU
+    assert app.menu[app.menu_cursor] is SETTINGS_ENTRY
+
+
+def test_settings_wont_start_a_second_sync(app, monkeypatch):
+    open_entry(app, SETTINGS_ENTRY)
+    monkeypatch.setattr(app.indexer, "start", lambda: False)
+    tap(app, "X")
+    assert app.message == "Already syncing"
+
+
+def test_menu_shows_sync_progress(app, monkeypatch):
+    app.screen = MENU
+    app.indexer.found = 42
+    monkeypatch.setattr(type(app.indexer), "running", property(lambda self: True))
+    assert app.sync_status() == "Syncing… 42"
+    app.display.images.clear()
+    app.dirty = False
+    app.tick(5.0)
+    assert app.display.images  # redrawn to count up
+
+
+# ---- playlists --------------------------------------------------------------------
+
+
+def test_playlists_play_what_matches(app, cfg):
+    cfg.playlists_dir.mkdir()
+    (cfg.playlists_dir / "Album one.txt").write_text("folder: Album 1\nsort: title\nlimit: 2")
+    (cfg.playlists_dir / "Nothing.txt").write_text("artist: nobody")
+    open_entry(app, PLAYLISTS_ENTRY)
+    assert app.screen == PLAYLISTS
+    assert [p.name for p in app.playlists] == ["Album one", "Nothing"]
+    app.render()
+    tap(app, "B")
+    tap(app, "X")
+    assert app.screen == PLAYLISTS
+    assert app.message.startswith("No tracks match")
+    app.render()
+    tap(app, "A")
+    tap(app, "X")
+    assert app.screen == NOW_PLAYING
+    assert names(app.playlist) == ["01 First.wav", "02 Second.wav"]
+
+
+def test_playlists_by_play_count(app, cfg, music):
+    cfg.playlists_dir.mkdir()
+    (cfg.playlists_dir / "Top.txt").write_text("sort: most played\nmin plays: 1")
+    app.db.record_play(music / "loose.wav")
+    app.db.record_play(music / "loose.wav")
+    app.db.record_play(music / "Album 1" / "10 Tenth.wav")
+    open_entry(app, PLAYLISTS_ENTRY)
+    tap(app, "X")
+    assert names(app.playlist) == ["loose.wav", "10 Tenth.wav"]
+
+
+def test_no_playlists(app):
+    open_entry(app, PLAYLISTS_ENTRY)
+    assert app.playlists == []
+    tap(app, "X")
+    assert app.screen == PLAYLISTS
+    app.render()
+    tap(app, "Y")
+    assert app.screen == MENU
+    assert app.menu[app.menu_cursor] is PLAYLISTS_ENTRY
+
+
+def test_runs_without_a_database(cfg, tmp_path):
+    (tmp_path / "blocker").write_text("")
+    a = App(replace(cfg, database=tmp_path / "blocker" / "library.db"), FakeDisplay(),
+            FakeButtons(), None, FakePlayer(), simulate=True)
+    a.start()
+    assert a.menu == [FILES_ENTRY, SETTINGS_ENTRY]
+    assert a.sync_status() == "Unavailable"
+    open_entry(a, SETTINGS_ENTRY)
+    tap(a, "X")
+    assert "couldn't be opened" in a.message
+    a.render()
+    a.close()

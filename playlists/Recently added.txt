@@ -1,0 +1,4 @@
+# The newest music on the player
+sort: recently added
+added in: 4 weeks
+limit: 100

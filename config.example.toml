@@ -1,6 +1,8 @@
 # Copy to ~/.config/pirateplayer/config.toml and uncomment what you want to change.
 
 # music_dir = "~/Music"
+# playlists_dir = "~/playlists"  # smart playlists: see playlists/README.txt
+# database = "~/.local/state/pirateplayer/library.db"  # the library index and play counts
 # volume = 50                # starting volume when there's no saved state
 # bluetooth_volume = 50      # the same for Bluetooth headphones, which keep their own volume
 # backlight_timeout = 30     # seconds; 0 keeps the screen on (uses more battery)

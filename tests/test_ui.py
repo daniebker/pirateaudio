@@ -5,7 +5,7 @@ from pirateplayer.battery import BatteryStatus
 from pirateplayer.bluetooth import PAIRING, BtDevice
 from pirateplayer.display import SIZE
 from pirateplayer.library import TrackInfo
-from pirateplayer.ui import BLUE, MenuEntry, Renderer, _clock, _fit
+from pirateplayer.ui import BLUE, MenuEntry, Renderer, Row, _clock, _fit
 
 
 @pytest.mark.parametrize("seconds,text", [(0, "0:00"), (-3, "0:00"), (59.9, "0:59"), (61, "1:01"),
@@ -85,3 +85,19 @@ def test_now_playing():
 
 def test_message():
     check(Renderer().message("Battery low\nPowering off…"))
+
+
+def test_list_screen():
+    r = Renderer()
+    rows = [Row("Sync library", "1234 tracks"), Row("A playlist with a long name", "Has errors")]
+    check(r.list_screen("Settings", rows, 1, BatteryStatus(50, False), playing=True,
+                        message="Synced 1234 tracks"))
+    check(r.list_screen("Playlists", rows * 10, 15, None, playing=False))
+    check(r.list_screen("Playlists", [], 0, None, playing=False, empty="No playlists"))
+
+
+def test_menu_icons():
+    r = Renderer()
+    entries = [MenuEntry("Files", "folder"), MenuEntry("Playlists", "playlist"),
+               MenuEntry("Bluetooth", "bluetooth"), MenuEntry("Settings", "settings")]
+    check(r.menu(entries, 3, {entries[3]: "Syncing… 120"}, None, playing=False))

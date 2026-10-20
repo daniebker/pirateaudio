@@ -1,4 +1,4 @@
-"""Drawing the browser, now-playing and Bluetooth screens."""
+"""Drawing the menu, browser, now-playing, playlist, settings and Bluetooth screens."""
 
 from functools import lru_cache
 from pathlib import Path
@@ -31,7 +31,15 @@ FONT_DIR = Path("/usr/share/fonts/truetype/dejavu")
 class MenuEntry(NamedTuple):
     """A row of the top-level menu, which opens another screen."""
     label: str
-    icon: str  # "folder" or "bluetooth"
+    icon: str  # "folder", "playlist", "settings" or "bluetooth"
+
+
+class Row(NamedTuple):
+    """A row of a list screen: a label, and a status at the right."""
+    label: str
+    status: str = ""
+    colour: tuple = FG
+    status_colour: tuple = DIM
 
 
 def _font(name: str, size: int):
@@ -85,6 +93,23 @@ def _folder_icon(draw, x: int, y: int, colour):
     """A folder, 16x12 pixels with its top-left corner at x, y."""
     draw.rectangle((x, y, x + 6, y + 2), fill=colour)
     draw.rectangle((x, y + 2, x + 16, y + 12), fill=colour)
+
+
+def _playlist_icon(draw, x: int, y: int, colour):
+    """Three lines of a list, 16x12 pixels with its top-left corner at x, y."""
+    for i in range(3):
+        draw.rectangle((x, y + i * 5, x + 16, y + i * 5 + 2), fill=colour)
+
+
+def _settings_icon(draw, x: int, y: int, colour):
+    """A cog, 14 pixels across with its top-left corner at x, y."""
+    cx, cy = x + 7, y + 7
+    draw.line((cx, y, cx, y + 14), fill=colour, width=3)
+    draw.line((x, cy, x + 14, cy), fill=colour, width=3)
+    draw.line((x + 2, y + 2, x + 12, y + 12), fill=colour, width=3)
+    draw.line((x + 2, y + 12, x + 12, y + 2), fill=colour, width=3)
+    draw.ellipse((x + 2, y + 2, x + 12, y + 12), fill=colour)
+    draw.ellipse((cx - 2, cy - 2, cx + 2, cy + 2), fill=BG)
 
 
 def _clock(seconds: float) -> str:
@@ -145,6 +170,12 @@ class Renderer:
             if entry.icon == "bluetooth":
                 colour = BLUE
                 _bluetooth_icon(draw, 16, y + 6, colour, h=14)
+            elif entry.icon == "playlist":
+                colour = GOOD
+                _playlist_icon(draw, 8, y + 7, colour)
+            elif entry.icon == "settings":
+                colour = DIM
+                _settings_icon(draw, 9, y + 6, colour)
             else:
                 colour = ACCENT
                 _folder_icon(draw, 8, y + 7, colour)
@@ -175,6 +206,39 @@ class Renderer:
                       fill=ACCENT if is_dir else FG)
         _scrollbar(draw, top, len(entries))
         return image
+
+    def list_screen(self, title: str, rows: list[Row], cursor: int, battery: BatteryStatus | None,
+                    playing: bool, bluetooth: bool = False, empty: str = "",
+                    message: str = "") -> Image.Image:
+        """A scrolling list of rows, with `empty` shown if there are none."""
+        image, draw = self._canvas()
+        self._header(draw, title, battery, "▶" if playing else "", bluetooth)
+        if not rows and empty:
+            draw.multiline_text((SIZE // 2, SIZE // 2), empty, font=self.text, fill=DIM,
+                                anchor="mm", align="center")
+        top = _top(cursor, len(rows))
+        for i, row in enumerate(rows[top:top + ROWS]):
+            y = HEADER + i * ROW
+            if top + i == cursor:
+                draw.rectangle((0, y, SIZE, y + ROW - 1), fill=SELECTED)
+            right = SIZE - 10
+            if row.status:
+                status = _fit(row.status, self.small, SIZE // 2)
+                right -= int(draw.textlength(status, font=self.small))
+                draw.text((right, y + 6), status, font=self.small, fill=row.status_colour)
+            draw.text((8, y + 4), _fit(row.label, self.text, right - 16), font=self.text,
+                      fill=row.colour)
+        _scrollbar(draw, top, len(rows))
+        if message:
+            self._message_box(draw, message)
+        return image
+
+    def _message_box(self, draw, message: str):
+        lines = message.count("\n") + 1
+        box = 10 + 18 * lines
+        draw.rectangle((0, SIZE - box, SIZE, SIZE), fill=(26, 27, 36))
+        draw.multiline_text((SIZE // 2, SIZE - box // 2), message, font=self.small, fill=FG,
+                            anchor="mm", align="center")
 
     def bluetooth(self, devices: list[BtDevice], cursor: int, scanning: bool, scan_left: float,
                   message: str, battery: BatteryStatus | None) -> Image.Image:
@@ -213,11 +277,7 @@ class Renderer:
                                 "Put your headset\nin pairing mode", font=self.text, fill=DIM,
                                 anchor="ma", align="center")
         if message:
-            lines = message.count("\n") + 1
-            box = 10 + 18 * lines
-            draw.rectangle((0, SIZE - box, SIZE, SIZE), fill=(26, 27, 36))
-            draw.multiline_text((SIZE // 2, SIZE - box // 2), message, font=self.small, fill=FG,
-                                anchor="mm", align="center")
+            self._message_box(draw, message)
         return image
 
     def now_playing(self, info: TrackInfo | None, state: str, position: float, volume: int,
