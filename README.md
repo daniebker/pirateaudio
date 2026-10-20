@@ -53,7 +53,7 @@ Connect the Pi's micro-USB port labelled **USB** (the one nearer the middle, not
 The Pi appears as a media player called "Pirate Audio Player" with a single drive, `Music`, whose contents are `~/Music`. Windows and most Linux desktops open it like a phone; macOS has no built-in MTP support, so use an app such as [OpenMTP](https://openmtp.ganeshrvel.com/). Files you copy on belong to your user on the Pi.
 
 - The player sees new files as soon as you browse to their folder.
-- Music added on the Pi while it's plugged in may not show on the computer until you reconnect, because computers cache the MTP file listing.
+- Music added on the Pi while it's plugged in won't show on the computer until you reconnect: the Pi doesn't send change notifications, because the umtprd version in Debian hangs when it does.
 - Gadget mode means the USB port can't be used for a keyboard or other USB device.
 - If nothing appears: `ls /sys/class/udc` should list a controller (if it's empty, reboot after running the installer), and `journalctl -u pirateplayer-mtp` shows errors. To turn the drive off: `sudo systemctl disable --now pirateplayer-mtp`.
 

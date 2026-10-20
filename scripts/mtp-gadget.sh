@@ -1,7 +1,13 @@
 #!/bin/sh
 # Present the Pi Zero to a USB host as an MTP device (a "media player" drive).
-# Run as root by mtp-gadget.service; umtprd serves the folders listed in /etc/umtprd/umtprd.conf.
+# Run as root by pirateplayer-mtp.service; umtprd serves the folders listed in /etc/umtprd/umtprd.conf.
+# umtprd itself runs as $MTP_USER, so the files it writes belong to that user: Debian's umtprd
+# is too old to understand default_uid/default_gid, and as root it makes everything root-only.
 set -eu
+
+MTP_USER=${MTP_USER:?set MTP_USER to the user who owns the shared folders}
+MTP_UID=$(id -u "$MTP_USER")
+MTP_GID=$(id -g "$MTP_USER")
 
 G=/sys/kernel/config/usb_gadget/pirateplayer
 FFS=/dev/ffs-mtp
@@ -37,10 +43,10 @@ if [ ! -d "$G" ]; then
 fi
 
 mkdir -p "$FFS"
-mount -t functionfs mtp "$FFS"
+mount -t functionfs -o uid="$MTP_UID",gid="$MTP_GID" mtp "$FFS"
 
 # umtprd writes the USB descriptors to ep0; the other endpoints appear once it has.
-umtprd &
+setpriv --reuid="$MTP_UID" --regid="$MTP_GID" --init-groups umtprd &
 UMTPRD=$!
 trap 'kill $UMTPRD 2>/dev/null; echo "" > "$G/UDC" 2>/dev/null' TERM INT
 

@@ -59,9 +59,10 @@ SERIAL=$(awk '/^Serial/ {print $3}' /proc/cpuinfo)
 sudo tee "$UMTPRD_CONF" >/dev/null <<EOF
 # pirateplayer: written by install.sh; re-running it overwrites this file.
 loop_on_disconnect 1
-default_uid $(id -u)
-default_gid $(id -g)
 umask 022
+# With inotify, Debian's umtprd (1.3.10) sends change events while holding a lock; hosts using
+# libmtp (Dolphin, Nautilus) never read them, so it hangs mid-copy. Fixed upstream in 1.6.8.
+no_inotify 0x1
 
 storage "$HOME/Music" "Music" "rw"
 
@@ -70,7 +71,6 @@ product "Pirate Audio Player"
 serial "${SERIAL:-0123456789}"
 firmware_version "1.0"
 interface "MTP"
-perceived_device_type 0x2
 
 usb_vendor_id 0x1D6B
 usb_product_id 0x0100
@@ -87,6 +87,8 @@ usb_epint_path "/dev/ffs-mtp/ep3"
 usb_max_packet_size 0x200
 EOF
 sudo install -m 755 "$HERE/scripts/mtp-gadget.sh" /usr/local/sbin/pirateplayer-mtp-gadget
+# Earlier versions ran umtprd as root, leaving root-only folders the player can't read.
+sudo chown -R "$RUN_USER:" "$HOME/Music"
 
 echo "==> Installing systemd service"
 sudo tee /etc/systemd/system/pirateplayer.service >/dev/null <<EOF
@@ -111,6 +113,7 @@ Description=Pirate Audio player USB music drive (MTP)
 After=local-fs.target sys-kernel-config.mount
 
 [Service]
+Environment=MTP_USER=$RUN_USER
 ExecStart=/usr/local/sbin/pirateplayer-mtp-gadget
 Restart=on-failure
 RestartSec=5
