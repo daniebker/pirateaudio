@@ -1,6 +1,7 @@
 """Run the player on a desktop: a pygame window stands in for the Pirate Audio hardware.
 
-The screen, buttons, UPS battery and audio are simulated; everything else is the real app.
+The screen, buttons, UPS battery, Bluetooth and audio are simulated; everything else is the
+real app.
 """
 
 import logging
@@ -13,8 +14,9 @@ os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 import pygame
 from PIL import Image
 
-from .app import BROWSER, App
+from .app import BLUETOOTH, BROWSER, MENU, App
 from .battery import BatteryStatus
+from .bluetooth import CONNECTING, DISCONNECTING, PAIRING, BtDevice, sort_devices
 from .buttons import PressTracker
 from .config import Config
 from .display import SIZE
@@ -34,8 +36,10 @@ KEYS = {
     pygame.K_y: "Y", pygame.K_ESCAPE: "Y", pygame.K_LEFT: "Y", pygame.K_BACKSPACE: "Y",
 }
 HINTS = {
+    MENU: {"A": "Up", "B": "Down", "X": "Open", "Y": "Playing"},
     BROWSER: {"A": "Up", "B": "Down", "X": "Open", "Y": "Back"},
     "now_playing": {"A": "Vol +", "B": "Vol -", "X": "Play/Pause", "Y": "Browse"},
+    BLUETOOTH: {"A": "Up", "B": "Down", "X": "Select", "Y": "Back"},
 }
 
 WINDOW_BG = (44, 46, 54)
@@ -99,6 +103,10 @@ class PygamePlayer:
             self.music.unpause()
             self.state = PLAYING
 
+    def pause(self):
+        if self.state == PLAYING:
+            self.toggle_pause()
+
     def stop(self):
         self.music.stop()
         self.state = STOPPED
@@ -111,6 +119,9 @@ class PygamePlayer:
     def set_volume(self, percent: int):
         self._volume = percent / 100
         self.music.set_volume(self._volume)
+
+    def set_audio_device(self, device: str):
+        log.info("Audio output: %s (simulated; still playing here)", device or "default")
 
     def poll_position(self):
         pass  # position is always current
@@ -137,6 +148,108 @@ class SimBattery:
 
     def read(self) -> BatteryStatus:
         return BatteryStatus(self.percent, self.external_power)
+
+
+class SimBluetooth:
+    """Pretend headsets: a scan finds them one by one, and pairing and connecting take a moment.
+
+    One is already paired, and one is out of range so connecting to it fails.
+    """
+
+    NEARBY = [("00:1A:7D:DA:71:13", "Sony WH-1000XM4", 0.0),
+              ("F4:4E:FD:00:12:34", "JBL Flip 5", 2.0),
+              ("2C:41:A1:55:0E:7B", "Bose QC Earbuds", 4.0),
+              ("40:EF:4C:8A:22:9F", "Old speaker (out of range)", 6.0)]
+
+    def __init__(self):
+        self.events: queue.Queue = queue.Queue()
+        self.scanning = False
+        self._scan_started = 0.0
+        address, name, _ = self.NEARBY[0]
+        self._devices = {address: BtDevice(address, name, paired=True)}
+        self._pending: list[tuple[float, object]] = []  # (when, callable)
+
+    def poll(self):
+        now = time.monotonic()
+        if self.scanning:
+            for address, name, after in self.NEARBY:
+                if address not in self._devices and now - self._scan_started >= after:
+                    self._devices[address] = BtDevice(address, name)
+                    self.events.put(("changed", None))
+        for item in [p for p in self._pending if p[0] <= now]:
+            self._pending.remove(item)
+            item[1]()
+
+    def _later(self, seconds: float, action):
+        self._pending.append((time.monotonic() + seconds, action))
+
+    def devices(self) -> list[BtDevice]:
+        return sort_devices(list(self._devices.values()))
+
+    def start_scan(self):
+        self.scanning = True
+        self._scan_started = time.monotonic()
+        self.events.put(("changed", None))
+
+    def stop_scan(self):
+        self.scanning = False
+        # Like BlueZ, forget unpaired devices that the scan found.
+        self._devices = {a: d for a, d in self._devices.items() if d.paired or d.busy}
+        self.events.put(("changed", None))
+
+    def connect(self, address: str, quiet: bool = False):
+        device = self._devices.get(address)
+        if device is None or device.busy or device.connected:
+            return
+        device.busy = CONNECTING if device.paired else PAIRING  # before stop_scan drops it
+        self.stop_scan()
+        for other in self._devices.values():
+            if other.connected:
+                self.switch_off(other.address)
+
+        def done():
+            device.busy = ""
+            if "out of range" in device.name:
+                if not quiet:
+                    self.events.put(("error", f"Couldn't connect to {device.name}:\n"
+                                              "not in range or switched off"))
+            else:
+                device.paired = device.connected = True
+                self.events.put(("audio", address))
+            self.events.put(("changed", None))
+        self._later(1.5, done)
+        self.events.put(("changed", None))
+
+    def disconnect(self, address: str):
+        device = self._devices.get(address)
+        if device is None or device.busy:
+            return
+        device.busy = DISCONNECTING
+        self.events.put(("changed", None))
+
+        def done():
+            device.busy = ""
+            self.switch_off(address)
+        self._later(0.5, done)
+
+    def switch_off(self, address: str | None = None):
+        """The headset going away: switched off, or out of range. None = whichever is connected."""
+        for device in self._devices.values():
+            if device.connected and address in (None, device.address):
+                device.connected = False
+                self.events.put(("audio", None))
+                self.events.put(("changed", None))
+
+    def forget(self, address: str):
+        self.switch_off(address)
+        self._devices.pop(address, None)
+        self.events.put(("changed", None))
+
+    def connected(self) -> str:
+        return next((d.name for d in self._devices.values() if d.connected), "")
+
+    def close(self):
+        pass
 
 
 class SimWindow:
@@ -172,7 +285,7 @@ class SimWindow:
 
         self._frame = Image.new("RGB", (SIZE, SIZE))
         self._backlight = True
-        self.hints = HINTS[BROWSER]
+        self.hints = HINTS[MENU]
         self.status = ""
 
     # -- display interface --
@@ -254,7 +367,8 @@ def run(cfg: Config, scale: int = 2, use_mpv: bool = False):
     window = SimWindow(scale)
     player = Player(cfg.audio_device) if use_mpv else PygamePlayer()
     battery = SimBattery()
-    app = App(cfg, window, window, battery, player, simulate=True)
+    bluetooth = SimBluetooth() if cfg.bluetooth else None
+    app = App(cfg, window, window, battery, player, simulate=True, bluetooth=bluetooth)
     log.info("Music folder: %s", cfg.music_dir)
 
     clock = pygame.time.Clock()
@@ -277,6 +391,8 @@ def run(cfg: Config, scale: int = 2, use_mpv: bool = False):
                         step = 10 if event.key == pygame.K_EQUALS else -10
                         battery.percent = min(100.0, max(0.0, battery.percent + step))
                     app.check_battery()
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_h and bluetooth:
+                    bluetooth.switch_off()
                 elif event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP):
                     window.handle_mouse(event)
 
@@ -287,6 +403,8 @@ def run(cfg: Config, scale: int = 2, use_mpv: bool = False):
             window.hints = HINTS[app.screen]
             charger = "charger connected" if battery.external_power else "on battery"
             audio = "mpv" if use_mpv else "pygame"
+            if bluetooth and bluetooth.connected():
+                audio = f"{bluetooth.connected()} [H] switch off"
             window.status = (f"Battery {battery.percent:.0f}% ({charger})  [C] charger  [-/=] level"
                              f"   ·   audio: {audio}")
             window.draw()

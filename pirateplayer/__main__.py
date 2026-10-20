@@ -7,6 +7,7 @@ from pathlib import Path
 from . import config
 from .app import App
 from .battery import open_battery
+from .bluetooth import open_bluetooth
 from .player import Player
 from .ui import Renderer
 
@@ -47,13 +48,16 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
     player = Player(cfg.audio_device)
-    app = App(cfg, display, buttons, battery, player)
+    bluetooth = open_bluetooth() if cfg.bluetooth else None
+    app = App(cfg, display, buttons, battery, player, bluetooth=bluetooth)
     try:
         app.run()
     except KeyboardInterrupt:
         pass
     finally:
         player.close()
+        if bluetooth:
+            bluetooth.close()
         display.set_backlight(False)
 
 

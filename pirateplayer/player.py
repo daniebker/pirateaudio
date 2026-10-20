@@ -110,6 +110,11 @@ class Player:
         if self.state != STOPPED:
             self._send("cycle", "pause")
 
+    def pause(self):
+        if self.state != STOPPED:
+            self.state = PAUSED
+            self._send("set_property", "pause", True)
+
     def stop(self):
         self.state = STOPPED
         self._send("stop")
@@ -120,6 +125,10 @@ class Player:
 
     def set_volume(self, percent: int):
         self._send("set_property", "volume", percent)
+
+    def set_audio_device(self, device: str):
+        """Switch output, e.g. to a Bluetooth headset; mpv reopens audio straight away."""
+        self._send("set_property", "audio-device", device or "auto")
 
     def poll_position(self):
         if self.state != STOPPED:

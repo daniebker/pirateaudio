@@ -1,5 +1,6 @@
 """The four Pirate Audio buttons, turned into tap / hold / repeat events."""
 
+import threading
 import time
 
 HOLD_TIME = 0.6     # seconds before a press counts as a hold
@@ -61,9 +62,20 @@ class GpioButtons:
         self._buttons = {name: Button(pin, pull_up=True) for name, pin in pins.items()}
         # Latch presses so a quick tap isn't lost while the main loop is busy drawing.
         self._latched = set()
+        self._changed = threading.Event()
         for name, button in self._buttons.items():
-            button.when_pressed = lambda _b=None, n=name: self._latched.add(n)
+            button.when_pressed = lambda _b=None, n=name: self._press(n)
+            button.when_released = lambda _b=None: self._changed.set()
         self._tracker = PressTracker()
+
+    def _press(self, name: str):
+        self._latched.add(name)
+        self._changed.set()
+
+    def wait(self, timeout: float):
+        """Sleep until a button changes, or for timeout seconds."""
+        self._changed.wait(timeout)
+        self._changed.clear()
 
     def poll(self) -> list[tuple[str, str]]:
         pressed = {}

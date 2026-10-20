@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
+from pirateplayer.bluetooth import BtDevice, sort_devices
 from pirateplayer.config import Config
 from pirateplayer.player import PAUSED, PLAYING, STOPPED
 
@@ -46,6 +47,7 @@ class FakePlayer:
         self.state = STOPPED
         self.position = 0.0
         self.volume = None
+        self.audio_device = None
         self.loaded: list[tuple[Path, float, bool]] = []
         self.seeks: list[float] = []
         self.polls = 0
@@ -61,6 +63,10 @@ class FakePlayer:
         elif self.state == PAUSED:
             self.state = PLAYING
 
+    def pause(self):
+        if self.state != STOPPED:
+            self.state = PAUSED
+
     def stop(self):
         self.state = STOPPED
 
@@ -71,8 +77,48 @@ class FakePlayer:
     def set_volume(self, percent):
         self.volume = percent
 
+    def set_audio_device(self, device):
+        self.audio_device = device
+
     def poll_position(self):
         self.polls += 1
+
+
+class FakeBluetooth:
+    """Stands in for Bluetooth: devices are set directly, and requests are recorded."""
+
+    def __init__(self, devices=()):
+        self.events: queue.Queue = queue.Queue()
+        self.scanning = False
+        self.list = list(devices)
+        self.calls: list[tuple] = []
+
+    def poll(self):
+        self.calls.append(("poll",))
+
+    def devices(self):
+        return sort_devices(self.list)
+
+    def start_scan(self):
+        self.calls.append(("start_scan",))
+        self.scanning = True
+
+    def stop_scan(self):
+        self.calls.append(("stop_scan",))
+        self.scanning = False
+
+    def connect(self, address, quiet=False):
+        self.calls.append(("connect", address, quiet))
+
+    def disconnect(self, address):
+        self.calls.append(("disconnect", address))
+
+    def forget(self, address):
+        self.calls.append(("forget", address))
+
+
+HEADSET = BtDevice("00:1A:7D:DA:71:13", "Headset", paired=True)
+SPEAKER = BtDevice("F4:4E:FD:00:12:34", "Speaker")
 
 
 class FakeDisplay:
