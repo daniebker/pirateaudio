@@ -8,6 +8,7 @@ It plays MP3, FLAC and WAV files from `~/Music`, organised in folders however yo
 - Remembers the playlist, track, position and volume across reboots, and resumes paused
 - Turns the screen off after 30s idle to save battery
 - Shows battery level, and powers off cleanly when the battery is nearly empty
+- Plug it into a computer and `~/Music` shows up as a drive (MTP), so you can copy music on without the network
 
 ## Buttons
 
@@ -38,9 +39,21 @@ The script:
 - installs `mpv` and the Python libraries
 - enables SPI, I2C and the Pirate Audio DAC in `config.txt` and turns off onboard audio
 - lets your user run `poweroff` without a password, for the low-battery shutdown
-- installs and enables the `pirateplayer` systemd service
+- enables USB gadget mode and sets up `umtp-responder` to share `~/Music` over MTP
+- installs and enables the `pirateplayer` and `pirateplayer-mtp` systemd services
 
-Put your music in `~/Music`, for example over the network with `scp` or `rsync`. Logs: `journalctl -u pirateplayer -f`.
+Put your music in `~/Music`, over USB (below) or over the network with `scp` or `rsync`. Logs: `journalctl -u pirateplayer -f`.
+
+## Copying music over USB
+
+Connect the Pi's micro-USB port labelled **USB** (the one nearer the middle, not **PWR**) to a computer. That port powers the Pi too, so one cable is enough, but it must be a data cable: many micro-USB cables only charge.
+
+The Pi appears as a media player called "Pirate Audio Player" with a single drive, `Music`, whose contents are `~/Music`. Windows and most Linux desktops open it like a phone; macOS has no built-in MTP support, so use an app such as [OpenMTP](https://openmtp.ganeshrvel.com/). Files you copy on belong to your user on the Pi.
+
+- The player sees new files as soon as you browse to their folder.
+- Music added on the Pi while it's plugged in may not show on the computer until you reconnect, because computers cache the MTP file listing.
+- Gadget mode means the USB port can't be used for a keyboard or other USB device.
+- If nothing appears: `ls /sys/class/udc` should list a controller (if it's empty, reboot after running the installer), and `journalctl -u pirateplayer-mtp` shows errors. To turn the drive off: `sudo systemctl disable --now pirateplayer-mtp`.
 
 ## Battery
 

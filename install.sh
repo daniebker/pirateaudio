@@ -10,7 +10,7 @@ CONFIG_TXT=/boot/firmware/config.txt
 
 echo "==> Installing packages"
 sudo apt-get update
-sudo apt-get install -y --no-install-recommends mpv
+sudo apt-get install -y --no-install-recommends mpv umtp-responder
 sudo apt-get install -y python3-venv python3-pil python3-mutagen python3-numpy \
     python3-gpiozero python3-lgpio python3-libgpiod python3-spidev python3-smbus2 fonts-dejavu-core
 
@@ -29,12 +29,13 @@ fi
 # Each line is added only if missing, so re-running picks up lines added in later versions.
 # The display's data/command line is GPIO 9 (SPI MISO), so SPI must leave that pin unclaimed.
 for line in dtparam=spi=on dtoverlay=spi0-2cs,no_miso dtparam=i2c_arm=on \
-            dtoverlay=hifiberry-dac gpio=25=op,dh; do
+            dtoverlay=hifiberry-dac gpio=25=op,dh dtoverlay=dwc2; do
     grep -qxF "$line" "$CONFIG_TXT" || echo "$line" | sudo tee -a "$CONFIG_TXT" >/dev/null
 done
 
 # dtparam=i2c_arm enables the I2C bus, but /dev/i2c-1 (for reading the UPS) needs i2c-dev.
-echo i2c-dev | sudo tee /etc/modules-load.d/pirateplayer.conf >/dev/null
+# dwc2 and libcomposite let the Pi act as a USB device, for the MTP music drive.
+printf 'i2c-dev\ndwc2\nlibcomposite\n' | sudo tee /etc/modules-load.d/pirateplayer.conf >/dev/null
 sudo modprobe i2c-dev
 
 echo "==> Permissions"
@@ -45,6 +46,47 @@ sudo chmod 440 /etc/sudoers.d/pirateplayer
 sudo visudo -cf /etc/sudoers.d/pirateplayer
 
 mkdir -p "$HOME/Music"
+
+echo "==> Configuring the USB music drive (MTP)"
+# Plugged into a computer through the USB data port, the Pi shows up as a media player
+# whose only drive is ~/Music. Files copied onto it belong to $RUN_USER.
+UMTPRD_CONF=/etc/umtprd/umtprd.conf
+sudo mkdir -p /etc/umtprd
+if [ -f "$UMTPRD_CONF" ] && ! grep -q "^# pirateplayer" "$UMTPRD_CONF"; then
+    sudo cp "$UMTPRD_CONF" "$UMTPRD_CONF.orig"
+fi
+SERIAL=$(awk '/^Serial/ {print $3}' /proc/cpuinfo)
+sudo tee "$UMTPRD_CONF" >/dev/null <<EOF
+# pirateplayer: written by install.sh; re-running it overwrites this file.
+loop_on_disconnect 1
+default_uid $(id -u)
+default_gid $(id -g)
+umask 022
+
+storage "$HOME/Music" "Music" "rw"
+
+manufacturer "Raspberry Pi"
+product "Pirate Audio Player"
+serial "${SERIAL:-0123456789}"
+firmware_version "1.0"
+interface "MTP"
+perceived_device_type 0x2
+
+usb_vendor_id 0x1D6B
+usb_product_id 0x0100
+usb_class 0x6
+usb_subclass 0x1
+usb_protocol 0x1
+usb_dev_version 0x3008
+
+usb_functionfs_mode 0x1
+usb_dev_path   "/dev/ffs-mtp/ep0"
+usb_epin_path  "/dev/ffs-mtp/ep1"
+usb_epout_path "/dev/ffs-mtp/ep2"
+usb_epint_path "/dev/ffs-mtp/ep3"
+usb_max_packet_size 0x200
+EOF
+sudo install -m 755 "$HERE/scripts/mtp-gadget.sh" /usr/local/sbin/pirateplayer-mtp-gadget
 
 echo "==> Installing systemd service"
 sudo tee /etc/systemd/system/pirateplayer.service >/dev/null <<EOF
@@ -62,9 +104,23 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF
+
+sudo tee /etc/systemd/system/pirateplayer-mtp.service >/dev/null <<EOF
+[Unit]
+Description=Pirate Audio player USB music drive (MTP)
+After=local-fs.target sys-kernel-config.mount
+
+[Service]
+ExecStart=/usr/local/sbin/pirateplayer-mtp-gadget
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
 sudo systemctl daemon-reload
-sudo systemctl enable pirateplayer.service
+sudo systemctl enable pirateplayer.service pirateplayer-mtp.service
 
 echo
 echo "Done. Reboot to apply the hardware settings: sudo reboot"
-echo "Logs: journalctl -u pirateplayer -f"
+echo "Logs: journalctl -u pirateplayer -f   (USB drive: journalctl -u pirateplayer-mtp)"
