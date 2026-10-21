@@ -6,8 +6,10 @@ import logging
 import os
 import re
 import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 from PIL import Image, ImageOps
 
@@ -15,6 +17,7 @@ log = logging.getLogger(__name__)
 
 TRACK_SUFFIXES = {".mp3", ".flac", ".wav"}
 COVER_NAMES = ("cover", "folder", "front", "album")
+LISTINGS_KEPT = 256  # folder listings remembered by read_dir()
 
 
 def _natural_text(text: str):
@@ -29,26 +32,96 @@ def is_track(path: Path) -> bool:
     return path.suffix.lower() in TRACK_SUFFIXES and path.is_file()
 
 
-def list_dir(directory: Path) -> list[Path]:
-    """Folders first, then tracks, in natural order. Hidden entries are skipped."""
+class Listing(NamedTuple):
+    entries: tuple[Path, ...]  # folders first, then tracks
+    dirs: int  # how many of the entries are folders
+
+
+_listings: OrderedDict[Path, tuple[int, Listing]] = OrderedDict()  # folder -> (mtime, listing)
+_listings_lock = threading.Lock()
+
+
+def read_dir(directory: Path) -> Listing:
+    """Folders first, then tracks, in natural order. Hidden entries are skipped.
+
+    Every stat is a read from the SD card on a Pi, so this doesn't stat the entries (scandir
+    knows which are folders), and remembers what it found: a folder's mtime changes whenever
+    anything in it is added, removed or renamed, so one stat says whether it's still right.
+    """
     try:
-        entries = [p for p in directory.iterdir() if not p.name.startswith(".")]
+        mtime = directory.stat().st_mtime_ns
     except OSError:
-        return []
-    dirs = sorted((p for p in entries if p.is_dir()), key=_natural_key)
-    tracks = sorted((p for p in entries if is_track(p)), key=_natural_key)
-    return dirs + tracks
+        return Listing((), 0)
+    with _listings_lock:
+        known = _listings.get(directory)
+        if known and known[0] == mtime:
+            _listings.move_to_end(directory)
+            return known[1]
+    dirs, tracks = [], []
+    try:
+        with os.scandir(directory) as found:
+            for entry in found:
+                if entry.name.startswith("."):
+                    continue
+                try:
+                    if entry.is_dir():
+                        dirs.append(Path(entry.path))
+                    elif (os.path.splitext(entry.name)[1].lower() in TRACK_SUFFIXES
+                          and entry.is_file()):
+                        tracks.append(Path(entry.path))
+                except OSError:  # gone since the folder was read
+                    continue
+    except OSError:
+        return Listing((), 0)
+    listing = Listing(tuple(sorted(dirs, key=_natural_key) + sorted(tracks, key=_natural_key)),
+                      len(dirs))
+    with _listings_lock:
+        _listings[directory] = (mtime, listing)
+        _listings.move_to_end(directory)
+        while len(_listings) > LISTINGS_KEPT:
+            _listings.popitem(last=False)
+    return listing
 
 
 def tracks_in(directory: Path, recursive: bool = False) -> list[Path]:
+    listing = read_dir(directory)
     tracks = []
-    for p in list_dir(directory):
-        if p.is_dir():
-            if recursive:
-                tracks.extend(tracks_in(p, recursive=True))
-        else:
-            tracks.append(p)
+    if recursive:
+        for folder in listing.entries[:listing.dirs]:
+            tracks.extend(tracks_in(folder, recursive=True))
+    tracks.extend(listing.entries[listing.dirs:])
     return tracks
+
+
+class ReadAhead:
+    """Reads folders with read_dir() in the background, so that they open straight away.
+
+    Only the latest request counts: a folder scrolled past isn't worth reading any more.
+    """
+
+    def __init__(self):
+        self._wanted: Path | None = None
+        self._wake = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def request(self, directory: Path):
+        self._wanted = directory
+        self._wake.set()
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._run, name="read-ahead", daemon=True)
+            self._thread.start()
+
+    def _run(self):
+        try:
+            os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 10)  # give way to drawing
+        except (AttributeError, OSError):  # not Linux, where each thread has its own priority
+            pass
+        while True:
+            self._wake.wait()
+            self._wake.clear()
+            directory, self._wanted = self._wanted, None
+            if directory is not None:
+                read_dir(directory)
 
 
 @dataclass

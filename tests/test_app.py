@@ -8,9 +8,10 @@ from pirateplayer import app as app_module
 from pirateplayer import buttons as btn
 from pirateplayer import database as database_module
 from pirateplayer.app import (BLUETOOTH, BLUETOOTH_ENTRY, BROWSER, COVER_FLOW, COVERS_ENTRY,
-                              FILES_ENTRY, LOW_BATTERY_READINGS, MENU, MESSAGE_TIME, NOW_PLAYING,
-                              PLAY_MAX, PLAYLISTS, PLAYLISTS_ENTRY, SCAN_TIME, SETTINGS,
-                              SETTINGS_ENTRY, VOLUME_STEP, App, open_library)
+                              FILES_ENTRY, LETTER_SHOWN, LOW_BATTERY_READINGS, MENU,
+                              MESSAGE_TIME, NOW_PLAYING, PLAY_MAX, PLAYLISTS, PLAYLISTS_ENTRY,
+                              SCAN_TIME, SETTINGS, SETTINGS_ENTRY, VOLUME_STEP, App,
+                              open_library)
 from pirateplayer.battery import BatteryStatus
 from pirateplayer.bluetooth import CONNECTING, audio_device
 from pirateplayer.player import PAUSED, PLAYING, STOPPED
@@ -87,6 +88,69 @@ def test_cursor_wraps_on_tap_and_clamps_on_repeat(app):
     for _ in range(5):
         app.on_button("B", btn.REPEAT, 1.0)
     assert app.cursor == 2
+
+
+def test_the_folder_under_the_cursor_is_read_ahead(app, music, monkeypatch):
+    requested = []
+    monkeypatch.setattr(app.read_ahead, "request", requested.append)
+    tap(app, "B")  # Album 2
+    tap(app, "B")  # loose.wav: not a folder
+    assert requested == [music / "Album 2"]
+    tap(app, "X")  # play it, without reading anything
+    tap(app, "Y")
+    app.open_dir(music)
+    assert requested == [music / "Album 2", music / "Album 1"]
+
+
+def lettered_folders(app, music, *names):
+    for name in names:
+        (music / name).mkdir()
+    app.open_dir(music)
+    return names
+
+
+def test_holding_b_jumps_to_the_next_letter(app, music):
+    lettered_folders(app, music, "Abba", "Beatles", "Blur", "Can", "Ébène", "2Pac")
+    assert names(app.entries) == ["2Pac", "Abba", "Album 1", "Album 2", "Beatles", "Blur",
+                                  "Can", "Ébène", "loose.wav"]
+    app.on_button("B", btn.HOLD, 10.0)
+    assert app.entries[app.cursor].name == "Abba"
+    assert app.letter == "A"
+    app.on_button("B", btn.REPEAT, 10.15)  # too soon: holding jumps every half second
+    assert app.entries[app.cursor].name == "Abba"
+    app.on_button("B", btn.REPEAT, 10.5)
+    assert app.entries[app.cursor].name == "Beatles"
+    app.on_button("B", btn.REPEAT, 11.0)
+    assert app.entries[app.cursor].name == "Can"
+    app.on_button("B", btn.REPEAT, 11.5)
+    assert (app.entries[app.cursor].name, app.letter) == ("Ébène", "E")  # without its accent
+    app.on_button("B", btn.REPEAT, 12.0)
+    assert app.entries[app.cursor].name == "loose.wav"  # tracks are lettered on their own
+    app.on_button("B", btn.REPEAT, 12.5)
+    assert app.entries[app.cursor].name == "loose.wav"  # stops at the end
+    app.render()  # with the letter showing
+    app.tick(12.5 + LETTER_SHOWN)
+    assert app.letter == ""
+
+
+def test_holding_a_jumps_back_a_letter(app, music):
+    lettered_folders(app, music, "Abba", "Beatles", "Blur", "Can")
+    app.cursor = names(app.entries).index("Blur")
+    app.on_button("A", btn.HOLD, 10.0)
+    assert app.entries[app.cursor].name == "Beatles"  # the start of this letter first
+    app.on_button("A", btn.REPEAT, 10.5)
+    assert app.entries[app.cursor].name == "Abba"
+    app.on_button("A", btn.REPEAT, 11.0)
+    assert app.cursor == 0
+    app.on_button("A", btn.REPEAT, 11.5)
+    assert app.cursor == 0  # stops at the top
+
+
+def test_tapping_still_moves_a_row(app, music):
+    lettered_folders(app, music, "Abba", "Beatles")
+    tap(app, "B")
+    assert app.entries[app.cursor].name == "Album 1"
+    assert app.letter == ""
 
 
 def test_open_folder_and_go_back(app, music):

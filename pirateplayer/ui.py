@@ -2,6 +2,7 @@
 screens."""
 
 import math
+from collections.abc import Sequence
 from functools import lru_cache
 from pathlib import Path
 from typing import NamedTuple
@@ -268,6 +269,7 @@ class Renderer:
         self.text = _font("DejaVuSans.ttf", 16)
         self.bold = _font("DejaVuSans-Bold.ttf", 18)
         self.note = _font("DejaVuSans.ttf", 64)
+        self.large = _font("DejaVuSans-Bold.ttf", 44)
         self._art_cache = (None, None)  # (source image, resized image)
         self._textures: dict = {}   # album: texture array, the most recently drawn last
         self._warped: dict = {}     # (album, offset): its pixels placed there
@@ -347,8 +349,11 @@ class Renderer:
                 draw.text((SIZE - 10, y + 6), text, font=self.small, fill=GOOD, anchor="ra")
         return image
 
-    def browser(self, title: str, entries: list[Path], cursor: int,
-                battery: BatteryStatus | None, playing: bool, bluetooth: bool = False) -> Image.Image:
+    def browser(self, title: str, entries: Sequence[Path], dirs: int, cursor: int,
+                battery: BatteryStatus | None, playing: bool, bluetooth: bool = False,
+                letter: str = "") -> Image.Image:
+        """Files: the first `dirs` entries are folders, the rest tracks. `letter`, if any, is
+        shown big in the middle, while A or B is held to jump through the alphabet."""
         image, draw = self._canvas()
         self._header(image, title, battery, "▶" if playing else "", bluetooth)
         if not entries:
@@ -360,11 +365,16 @@ class Renderer:
             y = HEADER + row * ROW
             if top + row == cursor:
                 draw.rectangle((0, y, SIZE, y + ROW - 1), fill=SELECTED)
-            is_dir = entry.is_dir()
+            is_dir = top + row < dirs  # known already: a stat per row makes scrolling lag
             label = entry.name + "/" if is_dir else entry.stem
             draw.text((8, y + 4), _fit(label, self.text, SIZE - 22), font=self.text,
                       fill=ACCENT if is_dir else FG)
         _scrollbar(draw, top, len(entries))
+        if letter:
+            middle, half = SIZE // 2, 36
+            draw.rounded_rectangle((middle - half, middle - half, middle + half, middle + half),
+                                   radius=10, fill=(26, 27, 36), outline=ACCENT, width=2)
+            draw.text((middle, middle), letter, font=self.large, fill=FG, anchor="mm")
         return image
 
     def list_screen(self, title: str, rows: list[Row], cursor: int, battery: BatteryStatus | None,

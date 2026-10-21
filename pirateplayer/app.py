@@ -7,14 +7,15 @@ import os
 import subprocess
 import threading
 import time
+import unicodedata
 from pathlib import Path
 
 from . import buttons as btn
 from .bluetooth import audio_device
 from .config import Config
 from .database import Database, Indexer, open_database
-from .library import (Album, TrackInfo, album_thumbnail, find_albums, is_track, list_dir,
-                      prune_thumbnails, read_info, tracks_in)
+from .library import (Album, ReadAhead, TrackInfo, album_thumbnail, find_albums, is_track,
+                      prune_thumbnails, read_dir, read_info, tracks_in)
 from .player import PLAYING, STOPPED, Player
 from .playlists import SmartPlaylist, load_all
 from .ui import COVER, LOW, MenuEntry, Renderer, Row, prepare_cover_flow
@@ -32,6 +33,8 @@ MESSAGE_TIME = 5.0        # seconds a message stays up
 SYNC_REDRAW = 1.0         # seconds between redraws of the sync progress
 FLOW_TIME = 0.08          # how quickly cover flow glides to the selected album
 FLOW_MAX = 3.0            # a long jump only animates the last few albums
+LETTER_TIME = 0.5         # seconds between jumps to the next letter while A or B is held in Files
+LETTER_SHOWN = 0.8        # how long the letter jumped to stays on screen
 # A track counts as played once it has played for half its length or 4 minutes, whichever is
 # sooner (the rule Last.fm uses), or when it plays to the end.
 PLAY_FRACTION = 0.5
@@ -45,6 +48,12 @@ PLAYLISTS_ENTRY = MenuEntry("Playlists", "playlist")
 BLUETOOTH_ENTRY = MenuEntry("Bluetooth", "bluetooth")
 SETTINGS_ENTRY = MenuEntry("Settings", "settings")
 SYNC_ROW, GAPLESS_ROW = 0, 1  # rows of the settings screen
+
+
+def initial(name: str) -> str:
+    """The letter a name is filed under, without its accent; # for digits and symbols."""
+    first = unicodedata.normalize("NFKD", name[:1])[:1].upper()
+    return first if first.isalpha() else "#"
 
 
 def move_cursor(cursor: int, count: int, step: int, kind: str) -> int:
@@ -92,8 +101,12 @@ class App:
         self.menu_cursor = 0
         self.root = cfg.music_dir
         self.cwd = self.root
-        self.entries = list_dir(self.cwd)
+        self.entries, self.dirs = read_dir(self.cwd)  # the first `dirs` entries are folders
         self.cursor = 0
+        self.read_ahead = ReadAhead()
+        self.last_jump = 0.0  # when holding A or B last jumped to another letter
+        self.letter = ""  # the letter jumped to, shown big until letter_until
+        self.letter_until = 0.0
 
         self.albums: list[Album] | None = None  # None until the first search finishes
         self.album_cursor = 0
@@ -196,6 +209,9 @@ class App:
         if self.message and now >= self.message_until:
             self.message = ""
             self.dirty = True
+        if self.letter and now >= self.letter_until:
+            self.letter = ""
+            self.dirty = True
 
         self.tick_cover_flow(now)
 
@@ -232,8 +248,9 @@ class App:
                                 self.battery_status, self.player.state == PLAYING, bt)
         if self.screen == BROWSER:
             title = "Music" if self.cwd == self.root else self.cwd.name
-            return self.ui.browser(title, self.entries, self.cursor, self.battery_status,
-                                   self.player.state == PLAYING, bt)
+            return self.ui.browser(title, self.entries, self.dirs, self.cursor,
+                                   self.battery_status, self.player.state == PLAYING, bt,
+                                   letter=self.letter)
         if self.screen == COVER_FLOW:
             return self.ui.cover_flow(self.albums, self.flow_position, self.battery_status,
                                       self.player.state == PLAYING, bt)
@@ -313,17 +330,24 @@ class App:
         self.menu_cursor = self.menu.index(select)
 
     def browser_button(self, name: str, kind: str):
-        if name in ("A", "B") and self.entries:
+        if name in ("A", "B") and self.entries and kind == btn.TAP:
             self.cursor = move_cursor(self.cursor, len(self.entries), -1 if name == "A" else 1, kind)
+            self.read_ahead_selected()
+        elif name in ("A", "B") and self.entries:
+            # Holding jumps a letter at a time: as soon as it counts as a hold, then every
+            # LETTER_TIME while it's held.
+            if kind == btn.HOLD or self.now - self.last_jump >= LETTER_TIME:
+                self.last_jump = self.now
+                self.jump_letter(-1 if name == "A" else 1)
+                self.read_ahead_selected()
         elif name == "X" and kind != btn.REPEAT and self.entries:
             entry = self.entries[self.cursor]
-            if entry.is_dir() and kind == btn.TAP:
+            if self.cursor < self.dirs and kind == btn.TAP:
                 self.open_dir(entry)
-            elif entry.is_dir():
+            elif self.cursor < self.dirs:
                 self.play(tracks_in(entry, recursive=True), 0)
             else:
-                tracks = [p for p in self.entries if not p.is_dir()]
-                self.play(tracks, tracks.index(entry))
+                self.play(list(self.entries[self.dirs:]), self.cursor - self.dirs)
         elif name == "Y" and kind == btn.TAP:
             if self.cwd != self.root:
                 self.open_dir(self.cwd.parent, select=self.cwd)
@@ -357,13 +381,42 @@ class App:
             else:
                 self.skip(-1)
 
+    def entry_group(self, index: int) -> tuple[bool, str]:
+        """Folders and tracks are lettered separately, as folders all come first."""
+        return index >= self.dirs, initial(self.entries[index].name)
+
+    def jump_letter(self, step: int):
+        """Down to the first entry of the next letter, or up to the first of this one (or of
+        the one before, if already there). Stops at the ends of the list."""
+        group = self.entry_group
+        if step > 0:
+            index = self.cursor
+            while index < len(self.entries) and group(index) == group(self.cursor):
+                index += 1
+            if index == len(self.entries):
+                return
+        else:
+            index = self.cursor
+            if index > 0 and group(index - 1) != group(index):
+                index -= 1  # already at the start of this letter: go to the one before
+            while index > 0 and group(index - 1) == group(index):
+                index -= 1
+        self.cursor = index
+        self.letter = group(index)[1]
+        self.letter_until = self.now + LETTER_SHOWN
+
     def open_dir(self, directory: Path, select: Path | None = None):
         if not directory.is_relative_to(self.root):
             directory = self.root
         self.cwd = directory
-        self.entries = list_dir(directory)
+        self.entries, self.dirs = read_dir(directory)
         self.cursor = self.entries.index(select) if select in self.entries else 0
+        self.read_ahead_selected()
 
+    def read_ahead_selected(self):
+        """Read the folder under the cursor in the background, so it opens without a wait."""
+        if self.cursor < self.dirs:
+            self.read_ahead.request(self.entries[self.cursor])
     # ---- playlists -----------------------------------------------------------
 
     def open_playlists(self):
