@@ -4,7 +4,7 @@ A music player for a Raspberry Pi Zero with a Pimoroni Pirate Audio HAT and a UP
 It plays MP3, FLAC and WAV files from `~/Music`, organised in folders however you like.
 
 - Uses `mpv` for playback, with video turned off so it stays light enough for a Pi Zero
-- A menu, a folder browser and a now-playing screen with cover art (embedded art, or `cover.jpg`/`folder.jpg` in the album folder). Tags are read from ID3 (MP3), Vorbis comments (FLAC), and ID3 or RIFF INFO chunks (WAV)
+- A menu, a folder browser, an iPod-style Cover Flow of your albums, and a now-playing screen with cover art (embedded art, or `cover.jpg`/`folder.jpg` in the album folder). Tags are read from ID3 (MP3), Vorbis comments (FLAC), and ID3 or RIFF INFO chunks (WAV)
 - Remembers the playlist, track, position and volume across reboots, and resumes paused
 - Turns the screen off after 30s idle to save battery
 - Shows battery level, and powers off cleanly when the battery is nearly empty
@@ -12,7 +12,7 @@ It plays MP3, FLAC and WAV files from `~/Music`, organised in folders however yo
 - Plays through Bluetooth headphones or speakers: scan, pair and connect from the player itself
 - Counts how often you play each track, and builds smart playlists from that (most played, not heard for a while, recently added…), described by text files in `~/playlists`
 
-**Contents:** [Hardware](#hardware) · [Installation](#installation) · [Adding music](#adding-music) · [Buttons](#buttons) · [Smart playlists](#smart-playlists) · [Bluetooth headphones](#bluetooth-headphones) · [Battery](#battery) · [Configuration](#configuration) · [Updating](#updating) · [Troubleshooting](#troubleshooting) · [Desktop simulator](#desktop-simulator) · [Tests](#tests)
+**Contents:** [Hardware](#hardware) · [Installation](#installation) · [Adding music](#adding-music) · [Buttons](#buttons) · [Smart playlists](#smart-playlists) · [Bluetooth headphones](#bluetooth-headphones) · [Battery](#battery) · [Configuration](#configuration) · [Updating](#updating) · [Troubleshooting](#troubleshooting) · [Desktop simulator](#desktop-simulator) · [Tests](#tests) · [License](#license)
 
 ## Hardware
 
@@ -173,6 +173,7 @@ Pirate Audio buttons: **A** top-left, **B** bottom-left, **X** top-right, **Y** 
 The player starts at the **menu**, or at the now-playing screen if it's resuming a playlist. The menu has these rows:
 
 - **Files**: the folders and tracks in `~/Music`.
+- **Cover Flow**: your albums' covers flowing across the screen like on an iPod classic.
 - **Playlists**: your [smart playlists](#smart-playlists).
 - **Bluetooth**: for [headphones](#bluetooth-headphones). Only there if the Pi has Bluetooth.
 - **Settings**: **Sync library** re-reads your music folder. It shows how many tracks the library has. Syncing pauses the music and locks the buttons until it's done (see [Smart playlists](#smart-playlists)).
@@ -186,6 +187,16 @@ The player starts at the **menu**, or at the now-playing screen if it's resuming
 | **Y** | Go to now playing | Parent folder (at the top: back to the menu) | Back to Files, with the current track selected |
 | **Y** hold | Go to now playing | Go to now playing | Previous track (or restart the current one if you're more than 3s in) |
 | **A + B** hold 3s | Power off | Power off | Power off |
+
+| | Cover Flow |
+|---|---|
+| **A** / **B** | Previous / next album (hold to scroll) |
+| **X** | Play the album |
+| **X** hold | Open the album in Files, to pick a track |
+| **Y** | Back to the menu |
+| **Y** hold | Go to now playing |
+
+Cover Flow shows every folder of tracks that has a cover (a `cover.jpg` or the like in the folder, or art embedded in its first track), in alphabetical order of album name. The name and artist come from the first track's tags, or the folder's name if it has none. The player looks through `~/Music` for albums in the background as soon as it has [synced the library](#smart-playlists) at startup, so they're usually ready by the time you open Cover Flow; on a big library, it says *Finding albums…* until they are. Each time you open it, it shows the albums it found last time while it checks again for changes. The first time, it also makes a small copy of each cover to flow through quickly; until it has, covers it hasn't reached yet can make the flow stutter.
 
 "Go to now playing" does nothing until you've played something. When the screen is off, the first press only wakes it up.
 
@@ -277,6 +288,7 @@ sudo systemctl restart pirateplayer
 | `music_dir` | `"~/Music"` | Where your music is |
 | `volume` | `50` | Starting volume (percent) when there's no saved state |
 | `bluetooth_volume` | `50` | The same for Bluetooth headphones, which keep their own volume |
+| `cache_dir` | `"~/.cache/pirateplayer"` | Where Cover Flow keeps small copies of album covers, so it doesn't have to decode the full-size ones as you flow through them. Safe to delete; they're made again |
 | `backlight_timeout` | `30` | Seconds without a button press before the screen turns off; `0` keeps it on (uses more battery) |
 | `rotation` | `90` | Screen rotation in degrees; 90 suits the Pirate Audio |
 | `y_pin` | `24` | GPIO for button Y; set `20` for early Pirate Audio boards |
@@ -352,3 +364,7 @@ python3 -m venv .venv
 ```
 
 GitHub Actions runs them on every push and pull request.
+
+## License
+
+[MIT](LICENSE)

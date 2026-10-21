@@ -14,7 +14,7 @@ os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 import pygame
 from PIL import Image
 
-from .app import BLUETOOTH, BROWSER, MENU, PLAYLISTS, SETTINGS, App
+from .app import BLUETOOTH, BROWSER, COVER_FLOW, MENU, PLAYLISTS, SETTINGS, App
 from .battery import BatteryStatus
 from .bluetooth import CONNECTING, DISCONNECTING, PAIRING, BtDevice, sort_devices
 from .buttons import PressTracker
@@ -38,6 +38,7 @@ KEYS = {
 HINTS = {
     MENU: {"A": "Up", "B": "Down", "X": "Open", "Y": "Playing"},
     BROWSER: {"A": "Up", "B": "Down", "X": "Open", "Y": "Back"},
+    COVER_FLOW: {"A": "Left", "B": "Right", "X": "Play", "Y": "Back"},
     "now_playing": {"A": "Vol +", "B": "Vol -", "X": "Play/Pause", "Y": "Browse"},
     BLUETOOTH: {"A": "Up", "B": "Down", "X": "Select", "Y": "Back"},
     PLAYLISTS: {"A": "Up", "B": "Down", "X": "Play", "Y": "Back"},
