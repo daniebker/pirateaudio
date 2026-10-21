@@ -5,14 +5,15 @@ import pytest
 
 from pirateplayer import app as app_module
 from pirateplayer import buttons as btn
-from pirateplayer.app import (BLUETOOTH, BLUETOOTH_ENTRY, BROWSER, FILES_ENTRY,
-                              LOW_BATTERY_READINGS, MENU, MESSAGE_TIME, NOW_PLAYING, SCAN_TIME,
-                              VOLUME_STEP, App)
+from pirateplayer.app import (BLUETOOTH, BLUETOOTH_ENTRY, BROWSER, COVER_FLOW, COVERS_ENTRY,
+                              FILES_ENTRY, LOW_BATTERY_READINGS, MENU, MESSAGE_TIME, NOW_PLAYING,
+                              SCAN_TIME, VOLUME_STEP, App)
 from pirateplayer.battery import BatteryStatus
 from pirateplayer.bluetooth import CONNECTING, audio_device
 from pirateplayer.player import PAUSED, PLAYING, STOPPED
 
-from .conftest import HEADSET, SPEAKER, FakeBluetooth, FakeButtons, FakeDisplay, FakePlayer
+from .conftest import (HEADSET, SPEAKER, FakeBluetooth, FakeButtons, FakeDisplay, FakePlayer,
+                       png_bytes)
 
 
 class FakeBattery:
@@ -56,7 +57,7 @@ def tap(app, name, now=1.0):
 def test_starts_at_menu(make_app):
     a = make_app(files=False)
     assert a.screen == MENU
-    assert a.menu == [FILES_ENTRY]  # no Bluetooth row without Bluetooth
+    assert a.menu == [FILES_ENTRY, COVERS_ENTRY]  # no Bluetooth row without Bluetooth
     a.on_button("X", btn.TAP, 1.0)
     assert a.screen == BROWSER
 
@@ -308,6 +309,105 @@ def test_open_dir_outside_root_goes_to_root(app, music, tmp_path):
     assert app.cwd == music
 
 
+# ---- cover flow ---------------------------------------------------------------
+
+
+@pytest.fixture
+def covers_app(make_app, music):
+    """Album 1 and Album 2/Disc 1 have covers; the music folder's loose track doesn't count."""
+    (music / "Album 1" / "cover.jpg").write_bytes(png_bytes((255, 0, 0)))
+    (music / "Album 2" / "Disc 1" / "folder.png").write_bytes(png_bytes((0, 0, 255)))
+    (music / "cover.jpg").write_bytes(png_bytes())
+    a = make_app(files=False)
+    tap(a, "B")
+    tap(a, "X")
+    return a
+
+
+def wait_for_albums(app, now=1.0):
+    app.album_search.join()
+    app.tick(now)
+
+
+def test_cover_flow_finds_albums_in_the_background(covers_app, music):
+    assert covers_app.screen == COVER_FLOW
+    assert covers_app.albums is None
+    covers_app.render()  # "Finding albums…"
+    wait_for_albums(covers_app)
+    assert [a.folder for a in covers_app.albums] == [music / "Album 1", music / "Album 2" / "Disc 1"]
+    assert covers_app.album_search is None
+    assert covers_app.display.images  # redrawn with the albums
+
+
+def test_albums_are_found_at_startup(make_app, music):
+    (music / "Album 1" / "cover.jpg").write_bytes(png_bytes())
+    a = make_app(files=False)
+    assert a.album_search is not None
+    wait_for_albums(a)
+    assert [album.folder for album in a.albums] == [music / "Album 1"]
+    assert len(list((a.cfg.cache_dir / "covers").iterdir())) == 1  # its thumbnail
+    tap(a, "B")
+    tap(a, "X")
+    assert a.screen == COVER_FLOW
+    assert a.albums is not None  # straight away, while it looks again for changes
+    assert a.album_search is not None
+
+
+def test_cover_flow_moves_and_glides(covers_app):
+    wait_for_albums(covers_app)
+    tap(covers_app, "B", now=1.0)
+    assert covers_app.album_cursor == 1
+    covers_app.tick(1.0)
+    assert covers_app.flow_position == 0.0  # no time has passed
+    covers_app.tick(1.05)
+    assert 0 < covers_app.flow_position < 1
+    covers_app.tick(2.0)
+    assert covers_app.flow_position == 1
+    tap(covers_app, "B")  # wraps
+    assert covers_app.album_cursor == 0
+    for _ in range(3):
+        covers_app.on_button("A", btn.REPEAT, 1.0)
+    assert covers_app.album_cursor == 0
+
+
+def test_cover_flow_plays_or_opens_an_album(covers_app, music):
+    wait_for_albums(covers_app)
+    tap(covers_app, "X")
+    assert covers_app.screen == NOW_PLAYING
+    assert names(covers_app.playlist) == ["01 First.wav", "02 Second.wav", "10 Tenth.wav"]
+    tap(covers_app, "Y")
+    tap(covers_app, "Y")
+    tap(covers_app, "Y")
+    tap(covers_app, "B")
+    tap(covers_app, "X")  # back in cover flow, on the same album
+    assert covers_app.screen == COVER_FLOW and covers_app.album_cursor == 0
+    tap(covers_app, "B")
+    covers_app.on_button("X", btn.HOLD, 1.0)
+    assert covers_app.screen == BROWSER
+    assert covers_app.cwd == music / "Album 2" / "Disc 1"
+
+
+def test_cover_flow_back_to_the_menu(covers_app):
+    tap(covers_app, "Y")
+    assert covers_app.screen == MENU
+    assert covers_app.menu[covers_app.menu_cursor] is COVERS_ENTRY
+
+
+def test_cover_flow_keeps_the_album_when_searching_again(covers_app, music):
+    wait_for_albums(covers_app)
+    tap(covers_app, "B")  # Disc 1
+    tap(covers_app, "Y")
+    (music / "Album 0").mkdir()
+    (music / "Album 1" / "01 First.wav").rename(music / "Album 0" / "01 First.wav")
+    (music / "Album 1" / "cover.jpg").rename(music / "Album 0" / "cover.jpg")
+    tap(covers_app, "X")
+    assert covers_app.album_cursor == 1  # the last list, until the new one comes
+    wait_for_albums(covers_app)
+    assert [a.folder.name for a in covers_app.albums] == ["Album 0", "Disc 1"]  # Album 1: no cover
+    assert covers_app.album_cursor == 1
+    assert covers_app.flow_position == 1
+
+
 # ---- bluetooth ----------------------------------------------------------------
 
 
@@ -317,12 +417,12 @@ def bt_app(make_app):
 
 
 def open_bluetooth_screen(app):
-    tap(app, "B")  # Bluetooth, the menu's second row
+    tap(app, "A")  # Bluetooth, the menu's last row
     tap(app, "X")
 
 
 def test_menu_has_bluetooth_with_bluetooth(bt_app):
-    assert bt_app.menu == [FILES_ENTRY, BLUETOOTH_ENTRY]
+    assert bt_app.menu == [FILES_ENTRY, COVERS_ENTRY, BLUETOOTH_ENTRY]
     tap(bt_app, "A")  # wraps
     assert bt_app.menu[bt_app.menu_cursor] is BLUETOOTH_ENTRY
 

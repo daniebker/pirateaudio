@@ -155,4 +155,5 @@ def music(tmp_path) -> Path:
 
 @pytest.fixture
 def cfg(tmp_path, music) -> Config:
-    return Config(music_dir=music, state_file=tmp_path / "state" / "state.json")
+    return Config(music_dir=music, state_file=tmp_path / "state" / "state.json",
+                  cache_dir=tmp_path / "cache")

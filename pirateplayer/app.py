@@ -2,17 +2,20 @@
 
 import json
 import logging
+import math
 import os
 import subprocess
+import threading
 import time
 from pathlib import Path
 
 from . import buttons as btn
 from .bluetooth import audio_device
 from .config import Config
-from .library import TrackInfo, is_track, list_dir, read_info, tracks_in
+from .library import (Album, TrackInfo, album_thumbnail, find_albums, is_track, list_dir,
+                      prune_thumbnails, read_info, tracks_in)
 from .player import PLAYING, STOPPED, Player
-from .ui import MenuEntry, Renderer
+from .ui import COVER, MenuEntry, Renderer, prepare_cover_flow
 
 log = logging.getLogger(__name__)
 
@@ -24,9 +27,13 @@ VOLUME_STEP = 5
 RESTART_THRESHOLD = 3.0   # "previous" restarts the track if we're further in than this
 SCAN_TIME = 30.0          # seconds a Bluetooth scan runs for
 MESSAGE_TIME = 5.0        # seconds a Bluetooth message stays up
+FLOW_TIME = 0.08          # how quickly cover flow glides to the selected album
+FLOW_MAX = 3.0            # a long jump only animates the last few albums
 
 MENU, BROWSER, NOW_PLAYING, BLUETOOTH = "menu", "browser", "now_playing", "bluetooth"
+COVER_FLOW = "cover_flow"
 FILES_ENTRY = MenuEntry("Files", "folder")
+COVERS_ENTRY = MenuEntry("Cover Flow", "covers")
 BLUETOOTH_ENTRY = MenuEntry("Bluetooth", "bluetooth")
 
 
@@ -47,15 +54,22 @@ class App:
         self.player = player
         self.simulate = simulate
         self.bluetooth = bluetooth
-        self.ui = Renderer()
+        self.cover_cache = cfg.cache_dir / "covers"
+        self.ui = Renderer(self.cover_cache)
 
         self.screen = MENU
-        self.menu = [FILES_ENTRY, BLUETOOTH_ENTRY] if bluetooth else [FILES_ENTRY]
+        self.menu = [FILES_ENTRY, COVERS_ENTRY] + ([BLUETOOTH_ENTRY] if bluetooth else [])
         self.menu_cursor = 0
         self.root = cfg.music_dir
         self.cwd = self.root
         self.entries = list_dir(self.cwd)
         self.cursor = 0
+
+        self.albums: list[Album] | None = None  # None until the first search finishes
+        self.album_cursor = 0
+        self.flow_position = 0.0  # the album in the middle of the screen, fractional while moving
+        self.album_search: threading.Thread | None = None  # until it has made the thumbnails
+        self.found_albums: list[Album] | None = None  # handed over by the search thread
 
         self.bt_selected: str | None = None  # address of the selected device; None = the scan row
         self.bt_audio: str | None = None     # address of the headset we're playing to
@@ -77,6 +91,7 @@ class App:
         self.dirty = True
         self.running = True
         self.last_input = self.last_battery = self.last_save = self.last_poll = 0.0
+        self.last_flow = 0.0
         self.now = 0.0  # the time of the tick or button press being handled
 
     @property
@@ -97,6 +112,8 @@ class App:
         self.display.set_backlight(True)
         self.restore_state()
         self.now = self.last_input = time.monotonic()
+        # So that Cover Flow has its albums ready by the time it's opened.
+        self.start_album_search()
         if self.bluetooth and self.bt_last:
             # Most headsets connect back by themselves when switched on, but not all.
             self.bluetooth.connect(self.bt_last, quiet=True)
@@ -123,6 +140,8 @@ class App:
 
         if self.bluetooth:
             self.tick_bluetooth(now)
+
+        self.tick_cover_flow(now)
 
         if now - self.last_battery >= BATTERY_INTERVAL:
             self.last_battery = now
@@ -155,6 +174,9 @@ class App:
             title = "Music" if self.cwd == self.root else self.cwd.name
             return self.ui.browser(title, self.entries, self.cursor, self.battery_status,
                                    self.player.state == PLAYING, bt)
+        if self.screen == COVER_FLOW:
+            return self.ui.cover_flow(self.albums, self.flow_position, self.battery_status,
+                                      self.player.state == PLAYING, bt)
         if self.screen == BLUETOOTH:
             devices = self.bluetooth.devices()
             return self.ui.bluetooth(devices, self.bt_cursor(devices), self.bluetooth.scanning,
@@ -180,6 +202,8 @@ class App:
             self.menu_button(name, kind)
         elif self.screen == BROWSER:
             self.browser_button(name, kind)
+        elif self.screen == COVER_FLOW:
+            self.cover_flow_button(name, kind)
         elif self.screen == BLUETOOTH:
             self.bluetooth_button(name, kind)
         else:
@@ -191,9 +215,12 @@ class App:
             self.menu_cursor = move_cursor(self.menu_cursor, len(self.menu),
                                            -1 if name == "A" else 1, kind)
         elif name == "X" and kind != btn.REPEAT:
-            if self.menu[self.menu_cursor] is FILES_ENTRY:
+            entry = self.menu[self.menu_cursor]
+            if entry is FILES_ENTRY:
                 self.screen = BROWSER
                 self.open_dir(self.root)
+            elif entry is COVERS_ENTRY:
+                self.open_cover_flow()
             else:
                 self.open_bluetooth()
         elif name == "Y" and kind != btn.REPEAT and self.playlist:
@@ -253,6 +280,83 @@ class App:
         self.cwd = directory
         self.entries = list_dir(directory)
         self.cursor = self.entries.index(select) if select in self.entries else 0
+
+    # ---- cover flow --------------------------------------------------------
+
+    def open_cover_flow(self):
+        """Show the albums found last time straight away, and look again in case music has
+        been added or removed since."""
+        self.screen = COVER_FLOW
+        self.flow_position = float(self.album_cursor)
+        self.start_album_search()
+
+    def start_album_search(self):
+        """Look for albums in the background, unless a search is already under way."""
+        if self.album_search is None:
+            self.album_search = threading.Thread(target=self.search_albums, daemon=True)
+            self.album_search.start()
+
+    def search_albums(self):
+        try:
+            # Give way to drawing the screen and to mpv: on a single-core Pi Zero a search
+            # at startup would otherwise make the first button presses sluggish.
+            os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 10)
+        except (AttributeError, OSError):  # not Linux, where each thread has its own priority
+            pass
+        try:
+            albums = find_albums(self.root)
+        except Exception:
+            log.exception("Album search failed")
+            self.found_albums = self.albums or []
+            return
+        self.found_albums = albums
+        prepare_cover_flow()
+        # Then make sure every cover has a thumbnail, so that flowing through them doesn't wait
+        # for big pictures to be decoded. The ones nearest the selected album come first.
+        middle = min(self.album_cursor, len(albums) - 1)
+        for index in sorted(range(len(albums)), key=lambda i: abs(i - middle)):
+            album_thumbnail(albums[index], COVER, self.cover_cache)
+        prune_thumbnails(albums, COVER, self.cover_cache)
+
+    def tick_cover_flow(self, now: float):
+        if self.found_albums is not None:
+            self.receive_albums(self.found_albums)
+        if self.album_search is not None and not self.album_search.is_alive():
+            self.album_search = None
+        if self.screen == COVER_FLOW and self.flow_position != self.album_cursor:
+            gap = self.album_cursor - self.flow_position
+            if abs(gap) > FLOW_MAX:
+                gap = math.copysign(FLOW_MAX, gap)
+            # Ease in: cover the same fraction of what's left every moment, so it slows as it
+            # arrives however long a frame takes to draw.
+            gap *= math.exp(-(now - self.last_flow) / FLOW_TIME)
+            self.flow_position = self.album_cursor - gap if abs(gap) > 0.02 else self.album_cursor
+            self.dirty = True
+        self.last_flow = now
+
+    def receive_albums(self, albums: list[Album]):
+        """Take the search's result, keeping the same album selected if it's still there."""
+        selected = self.albums[self.album_cursor].folder if self.albums else None
+        folders = [a.folder for a in albums]
+        self.album_cursor = folders.index(selected) if selected in folders else 0
+        self.flow_position = float(self.album_cursor)
+        self.albums = albums
+        self.found_albums = None
+        self.dirty = True
+
+    def cover_flow_button(self, name: str, kind: str):
+        if name in ("A", "B") and self.albums:
+            self.album_cursor = move_cursor(self.album_cursor, len(self.albums),
+                                            -1 if name == "A" else 1, kind)
+        elif name == "X" and kind == btn.TAP and self.albums:
+            self.play(tracks_in(self.albums[self.album_cursor].folder), 0)
+        elif name == "X" and kind == btn.HOLD and self.albums:
+            self.screen = BROWSER  # to pick a track from it
+            self.open_dir(self.albums[self.album_cursor].folder)
+        elif name == "Y" and kind == btn.TAP:
+            self.open_menu(COVERS_ENTRY)
+        elif name == "Y" and kind == btn.HOLD and self.playlist:
+            self.screen = NOW_PLAYING
 
     # ---- bluetooth ---------------------------------------------------------
 
