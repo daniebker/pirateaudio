@@ -257,6 +257,7 @@ Pi Zero W and Zero 2 W boards have Bluetooth. Open **Bluetooth** from the menu: 
 | **Y** | Back to the menu |
 
 - Once a headset connects, music plays through it, a blue Bluetooth sign shows in the header, and the menu shows the headset's name. When it disconnects or goes out of range, playback pauses, and pressing play carries on through the Pirate Audio.
+- The headset's own buttons work: a tap plays or pauses, and next/previous skip tracks (previous goes back to the start of the track first, like holding **Y**). If they do nothing, the log says whether *Headset buttons ready* and shows each press as *Headset button: …*.
 - At startup the player reconnects to the last headset it played to. Most headsets also connect back by themselves when switched on.
 - One headset at a time: connecting another disconnects the first.
 - Headphones and the Pirate Audio each keep their own volume, so switching between them doesn't blast your ears or leave the speaker too quiet to hear.

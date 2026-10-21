@@ -1,5 +1,6 @@
-"""Bluetooth headsets: scanning, pairing and connecting through BlueZ, and finding the
-bluez-alsa PCM that mpv plays to once a headset is connected.
+"""Bluetooth headsets: scanning, pairing and connecting through BlueZ, finding the
+bluez-alsa PCM that mpv plays to once a headset is connected, and taking the headset's
+play/pause, next and previous buttons (AVRCP), which BlueZ passes to a registered media player.
 
 Everything runs on the main thread: poll() dispatches pending D-Bus messages, and the slow
 calls (Pair, Connect) are asynchronous, reporting back through `events`.
@@ -16,11 +17,17 @@ BLUEZ = "org.bluez"
 BLUEALSA = "org.bluealsa"
 BLUEALSA_ROOT = "/org/bluealsa"
 AGENT_PATH = "/pirateplayer/agent"
+PLAYER_PATH = "/pirateplayer/player"
 OBJECT_MANAGER = "org.freedesktop.DBus.ObjectManager"
 PROPERTIES = "org.freedesktop.DBus.Properties"
 ADAPTER = "org.bluez.Adapter1"
 DEVICE = "org.bluez.Device1"
 PCM = "org.bluealsa.PCM1"
+MEDIA = "org.bluez.Media1"
+MPRIS_PLAYER = "org.mpris.MediaPlayer2.Player"  # what BlueZ calls a registered player through
+
+# The headset buttons, as BlueZ calls the player's methods.
+CONTROLS = ("Play", "Pause", "PlayPause", "Stop", "Next", "Previous")
 
 A2DP_SINK_UUID = "0000110b-0000-1000-8000-00805f9b34fb"
 AUDIO_VIDEO_CLASS = 0x04  # major device class, bits 8-12 of the Class property
@@ -109,6 +116,21 @@ def pick_sink(pcms: dict[str, dict]) -> str | None:
     return address_from_path(str(newest.get("Device", ""))) or None
 
 
+def player_status(state: str) -> str:
+    """The MPRIS PlaybackStatus for a player state: "playing" -> "Playing", and so on."""
+    return state.capitalize()
+
+
+def player_metadata(title: str, artist: str, album: str, length: float) -> dict:
+    """The MPRIS Metadata BlueZ passes on to the headset, which some read out or show."""
+    metadata = {"xesam:title": title, "mpris:length": int(length * 1_000_000)}
+    if artist:
+        metadata["xesam:artist"] = [artist]
+    if album:
+        metadata["xesam:album"] = album
+    return metadata
+
+
 def _reason(error) -> str:
     name = error.get_dbus_name() or ""
     message = error.get_dbus_message() or ""
@@ -133,7 +155,7 @@ class Bluetooth:
         self._bus = dbus.SystemBus(mainloop=DBusGMainLoop(), private=True)
 
         # Events for the main loop: ("changed", None), ("audio", address or None),
-        # ("error", message)
+        # ("error", message), ("control", one of CONTROLS) when a headset button is pressed
         self.events: queue.Queue = queue.Queue()
         self.scanning = False
         self._devices: dict[str, dict] = {}  # BlueZ object path -> Device1 properties
@@ -165,6 +187,14 @@ class Bluetooth:
         manager.RegisterAgent(AGENT_PATH, "NoInputNoOutput")
         manager.RequestDefaultAgent(AGENT_PATH)
         self._agent_manager = manager
+
+        # Without a registered player, BlueZ drops the headset's button presses.
+        self._player = _make_player(self, self._bus)
+        self._media = dbus.Interface(self._bus.get_object(BLUEZ, self._adapter_path), MEDIA)
+        self._media.RegisterPlayer(PLAYER_PATH, self._player.properties,
+                                   reply_handler=lambda: log.info("Headset buttons ready"),
+                                   error_handler=lambda e: log.warning(
+                                       "Headset buttons unavailable: %s", e))
 
         for bus_name in (BLUEZ, BLUEALSA):
             self._bus.add_signal_receiver(self._interfaces_added, "InterfacesAdded", OBJECT_MANAGER,
@@ -254,12 +284,17 @@ class Bluetooth:
             self._adapter.RemoveDevice(path, reply_handler=lambda: None,
                                        error_handler=lambda e: self._call_failed("forget", e))
 
+    def now_playing(self, state: str, position: float, metadata: dict | None):
+        """Tell BlueZ what's playing, for headsets that pick play or pause by it."""
+        self._player.update(state, position, metadata)
+
     def close(self):
-        try:
-            self.stop_scan()
-            self._agent_manager.UnregisterAgent(AGENT_PATH)
-        except self._dbus.DBusException:
-            pass
+        for unregister in (self.stop_scan, lambda: self._agent_manager.UnregisterAgent(AGENT_PATH),
+                           lambda: self._media.UnregisterPlayer(PLAYER_PATH)):
+            try:
+                unregister()
+            except self._dbus.DBusException:
+                pass
         self._bus.close()
 
     # ---- helpers -------------------------------------------------------------
@@ -411,6 +446,85 @@ def _make_agent(bt: Bluetooth, bus):
             pass
 
     return Agent(bus, AGENT_PATH)
+
+
+def _make_player(bt: Bluetooth, bus):
+    """The media player BlueZ forwards a headset's buttons to, as calls to MPRIS methods.
+
+    Called on the main thread, from poll(), so the presses go to the main loop as events.
+    """
+    import dbus
+    import dbus.service
+
+    class Player(dbus.service.Object):
+        def __init__(self):
+            super().__init__(bus, PLAYER_PATH)
+            self.properties = dbus.Dictionary({
+                "PlaybackStatus": "Stopped",
+                "Position": dbus.Int64(0),
+                "CanControl": True, "CanPlay": True, "CanPause": True,
+                "CanGoNext": True, "CanGoPrevious": True,
+            }, signature="sv")
+
+        def update(self, state: str, position: float, metadata: dict | None):
+            changed = {"PlaybackStatus": player_status(state),
+                       "Position": dbus.Int64(int(position * 1_000_000))}
+            if metadata is not None:
+                metadata = dict(metadata)
+                if "mpris:length" in metadata:
+                    metadata["mpris:length"] = dbus.Int64(metadata["mpris:length"])
+                if "xesam:artist" in metadata:
+                    metadata["xesam:artist"] = dbus.Array(metadata["xesam:artist"], signature="s")
+                changed["Metadata"] = dbus.Dictionary(metadata, signature="sv")
+            self.properties.update(changed)
+            self.PropertiesChanged(MPRIS_PLAYER, dbus.Dictionary(changed, signature="sv"),
+                                   dbus.Array([], signature="s"))
+
+        def _control(self, name: str):
+            log.info("Headset button: %s", name)
+            bt.events.put(("control", name))
+
+        @dbus.service.method(MPRIS_PLAYER, in_signature="", out_signature="")
+        def Play(self):
+            self._control("Play")
+
+        @dbus.service.method(MPRIS_PLAYER, in_signature="", out_signature="")
+        def Pause(self):
+            self._control("Pause")
+
+        @dbus.service.method(MPRIS_PLAYER, in_signature="", out_signature="")
+        def PlayPause(self):
+            self._control("PlayPause")
+
+        @dbus.service.method(MPRIS_PLAYER, in_signature="", out_signature="")
+        def Stop(self):
+            self._control("Stop")
+
+        @dbus.service.method(MPRIS_PLAYER, in_signature="", out_signature="")
+        def Next(self):
+            self._control("Next")
+
+        @dbus.service.method(MPRIS_PLAYER, in_signature="", out_signature="")
+        def Previous(self):
+            self._control("Previous")
+
+        @dbus.service.method(PROPERTIES, in_signature="ss", out_signature="v")
+        def Get(self, interface, name):
+            return self.properties[name]
+
+        @dbus.service.method(PROPERTIES, in_signature="s", out_signature="a{sv}")
+        def GetAll(self, interface):
+            return self.properties
+
+        @dbus.service.method(PROPERTIES, in_signature="ssv", out_signature="")
+        def Set(self, interface, name, value):
+            pass  # repeat and shuffle, from headsets that have them: not supported
+
+        @dbus.service.signal(PROPERTIES, signature="sa{sv}as")
+        def PropertiesChanged(self, interface, changed, invalidated):
+            pass
+
+    return Player()
 
 
 def open_bluetooth():

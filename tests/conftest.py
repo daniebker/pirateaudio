@@ -121,6 +121,9 @@ class FakeBluetooth:
     def forget(self, address):
         self.calls.append(("forget", address))
 
+    def now_playing(self, state, position, metadata):
+        self.calls.append(("now_playing", state, metadata and metadata["xesam:title"]))
+
 
 HEADSET = BtDevice("00:1A:7D:DA:71:13", "Headset", paired=True)
 SPEAKER = BtDevice("F4:4E:FD:00:12:34", "Speaker")
