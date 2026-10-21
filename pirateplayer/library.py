@@ -1,12 +1,15 @@
 """Browsing the music folder and reading track metadata."""
 
+import hashlib
 import io
 import logging
+import os
 import re
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 log = logging.getLogger(__name__)
 
@@ -14,8 +17,12 @@ TRACK_SUFFIXES = {".mp3", ".flac", ".wav"}
 COVER_NAMES = ("cover", "folder", "front", "album")
 
 
+def _natural_text(text: str):
+    return [int(t) if t.isdigit() else t.casefold() for t in re.split(r"(\d+)", text)]
+
+
 def _natural_key(path: Path):
-    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", path.name)]
+    return _natural_text(path.name)
 
 
 def is_track(path: Path) -> bool:
@@ -54,7 +61,14 @@ class TrackInfo:
 
 
 def read_info(path: Path) -> TrackInfo:
-    info = TrackInfo(title=path.stem)
+    tags, pictures, length = _read_tags(path)
+    return TrackInfo(title=tags.get("title") or path.stem, artist=tags.get("artist", ""),
+                     album=tags.get("album", ""), length=length,
+                     art=_open_picture(pictures) or _folder_art(path.parent))
+
+
+def _read_tags(path: Path) -> tuple[dict[str, str], list[bytes], float]:
+    """A track's tags, its embedded pictures (front cover first, not yet decoded) and length."""
     try:
         import mutagen
 
@@ -63,23 +77,17 @@ def read_info(path: Path) -> TrackInfo:
         log.warning("Could not read tags from %s: %s", path, e)
         audio = None
 
-    tags = {}
+    tags, pictures, length = {}, [], 0.0
     if audio is not None:
-        info.length = audio.info.length
-        tags, info.art = _tags_and_art(audio)
+        length = audio.info.length
+        tags, pictures = _tags_and_pictures(audio)
     if path.suffix.lower() == ".wav":
         # WAV files usually carry RIFF INFO tags, which mutagen doesn't read.
         tags = _riff_info(path) | {k: v for k, v in tags.items() if v}
-
-    info.title = tags.get("title") or path.stem
-    info.artist = tags.get("artist", "")
-    info.album = tags.get("album", "")
-    if info.art is None:
-        info.art = _folder_art(path.parent)
-    return info
+    return tags, pictures, length
 
 
-def _tags_and_art(audio) -> tuple[dict[str, str], Image.Image | None]:
+def _tags_and_pictures(audio) -> tuple[dict[str, str], list[bytes]]:
     from mutagen.id3 import ID3
 
     tags, pictures = audio.tags, []
@@ -91,7 +99,8 @@ def _tags_and_art(audio) -> tuple[dict[str, str], Image.Image | None]:
                     return str(frame.text[0]).strip()
             return ""
 
-        found = {"title": text("TIT2"), "artist": text("TPE1", "TPE2"), "album": text("TALB")}
+        found = {"title": text("TIT2"), "artist": text("TPE1", "TPE2"), "album": text("TALB"),
+                 "albumartist": text("TPE2", "TPE1")}
         pictures = [tags[k].data for k in tags.keys() if k.startswith("APIC")]
     elif tags is not None:  # Vorbis comments (FLAC)
         def text(*keys):
@@ -102,19 +111,33 @@ def _tags_and_art(audio) -> tuple[dict[str, str], Image.Image | None]:
             return ""
 
         found = {"title": text("title"), "artist": text("artist", "albumartist"),
-                 "album": text("album")}
+                 "album": text("album"), "albumartist": text("albumartist", "artist")}
     else:
         found = {}
     # FLAC keeps pictures outside the tags; prefer the front cover (type 3).
     flac_pictures = sorted(getattr(audio, "pictures", []), key=lambda p: p.type != 3)
     pictures += [p.data for p in flac_pictures]
+    return found, pictures
 
+
+def _open_picture(pictures: list[bytes], size: int | None = None) -> Image.Image | None:
     for data in pictures:
-        try:
-            return found, Image.open(io.BytesIO(data)).convert("RGB")
-        except Exception:
-            pass
-    return found, None
+        image = _open_image(io.BytesIO(data), size)
+        if image is not None:
+            return image
+    return None
+
+
+def _open_image(source, size: int | None = None) -> Image.Image | None:
+    """Decode an image file or buffer, or None if it isn't one. With a size, a big JPEG is
+    decoded at a fraction of its resolution, still at least that size: much faster on a Pi."""
+    try:
+        image = Image.open(source)
+        if size:
+            image.draft("RGB", (size, size))
+        return image.convert("RGB")
+    except Exception:
+        return None
 
 
 def _riff_info(path: Path) -> dict[str, str]:
@@ -146,15 +169,112 @@ def _riff_info(path: Path) -> dict[str, str]:
     return found
 
 
-def _folder_art(directory: Path) -> Image.Image | None:
+def _cover_files(directory: Path) -> list[Path]:
     try:
-        candidates = [p for p in directory.iterdir()
-                      if p.stem.lower() in COVER_NAMES and p.suffix.lower() in (".jpg", ".jpeg", ".png")]
+        return sorted(p for p in directory.iterdir()
+                      if p.stem.lower() in COVER_NAMES and p.suffix.lower() in (".jpg", ".jpeg", ".png"))
     except OSError:
-        return None
-    for p in sorted(candidates):
-        try:
-            return Image.open(p).convert("RGB")
-        except Exception:
-            pass
+        return []
+
+
+def _folder_art(directory: Path, size: int | None = None) -> Image.Image | None:
+    for p in _cover_files(directory):
+        image = _open_image(p, size)
+        if image is not None:
+            return image
     return None
+
+
+# ---- albums -------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Album:
+    """A folder of tracks that has cover art, named from its first track's tags."""
+    name: str
+    artist: str
+    folder: Path
+    cover: Path  # the image file, or the track the picture is embedded in
+
+
+def find_albums(root: Path) -> list[Album]:
+    """Every folder below root with tracks in it and a cover, in alphabetical order of album
+    name. Loose tracks in root itself aren't an album. The cover is a cover.jpg (or the like) in the folder, or a picture embedded in its
+    first track. This reads one track per folder, so it takes a while on a big library."""
+    albums = []
+    for directory, subdirs, _ in os.walk(root):
+        subdirs[:] = [d for d in subdirs if not d.startswith(".")]
+        tracks = tracks_in(Path(directory)) if Path(directory) != root else []
+        if not tracks:
+            continue
+        tags, pictures, _ = _read_tags(tracks[0])
+        covers = _cover_files(Path(directory))
+        if covers:
+            cover = covers[0]
+        elif pictures:
+            cover = tracks[0]
+        else:
+            continue
+        albums.append(Album(name=tags.get("album") or Path(directory).name,
+                            artist=tags.get("albumartist") or tags.get("artist", ""),
+                            folder=Path(directory), cover=cover))
+    albums.sort(key=lambda a: (_natural_text(a.name), _natural_text(a.artist), _natural_key(a.folder)))
+    return albums
+
+
+def album_art(album: Album, size: int | None = None) -> Image.Image | None:
+    """The album's cover, decoded at no less than size (if given) for speed."""
+    if is_track(album.cover):
+        return _open_picture(_read_tags(album.cover)[1], size)
+    return _open_image(album.cover, size) or _folder_art(album.folder, size)
+
+
+def _thumbnail_path(album: Album, size: int, cache_dir: Path) -> Path:
+    """Named for the cover file and when it last changed, so a new cover gets a new name."""
+    stat = album.cover.stat()
+    key = f"{album.cover}:{stat.st_mtime_ns}:{stat.st_size}:{size}"
+    return cache_dir / (hashlib.sha1(key.encode()).hexdigest() + ".rgb")
+
+
+def album_thumbnail(album: Album, size: int, cache_dir: Path | None = None) -> Image.Image | None:
+    """The album's cover cropped square at size. Decoding a full-size cover takes a Pi Zero a
+    few hundred milliseconds, so the result is kept in cache_dir as raw pixels, which take it
+    a few milliseconds to read back."""
+    try:
+        path = _thumbnail_path(album, size, cache_dir) if cache_dir else None
+    except OSError:  # the cover has gone
+        return None
+    if path is not None:
+        try:
+            return Image.frombytes("RGB", (size, size), path.read_bytes())
+        except (OSError, ValueError):  # not made yet, or cut short
+            pass
+    art = album_art(album, size)
+    if art is None:
+        return None
+    thumbnail = ImageOps.fit(art, (size, size))
+    if path is not None:
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(f".{threading.get_native_id()}.tmp")  # threads may race
+            tmp.write_bytes(thumbnail.tobytes())
+            os.replace(tmp, path)
+        except OSError as e:
+            log.warning("Could not save a thumbnail of %s: %s", album.cover, e)
+    return thumbnail
+
+
+def prune_thumbnails(albums: list[Album], size: int, cache_dir: Path):
+    """Delete thumbnails of covers that have changed or gone."""
+    keep = set()
+    for album in albums:
+        try:
+            keep.add(_thumbnail_path(album, size, cache_dir))
+        except OSError:
+            pass
+    try:
+        for path in cache_dir.iterdir():
+            if path not in keep and path.suffix != ".tmp":
+                path.unlink(missing_ok=True)
+    except OSError as e:
+        log.warning("Could not prune thumbnails: %s", e)
