@@ -1,0 +1,5 @@
+# What you've played most over the last month
+sort: most played
+period: 30 days
+min plays: 2
+limit: 25

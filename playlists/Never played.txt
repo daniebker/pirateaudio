@@ -1,0 +1,4 @@
+# Tracks you haven't listened to yet, shuffled
+sort: random
+max plays: 0
+limit: 100

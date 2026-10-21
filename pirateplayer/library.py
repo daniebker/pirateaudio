@@ -58,13 +58,17 @@ class TrackInfo:
     album: str = ""
     length: float = 0.0
     art: Image.Image | None = None
+    genre: str = ""
+    year: str = ""
 
 
-def read_info(path: Path) -> TrackInfo:
+def read_info(path: Path, art: bool = True) -> TrackInfo:
+    """Tags, length and cover art. Without `art`, skips decoding the cover, which is slow."""
     tags, pictures, length = _read_tags(path)
     return TrackInfo(title=tags.get("title") or path.stem, artist=tags.get("artist", ""),
                      album=tags.get("album", ""), length=length,
-                     art=_open_picture(pictures) or _folder_art(path.parent))
+                     art=(_open_picture(pictures) or _folder_art(path.parent)) if art else None,
+                     genre=tags.get("genre", ""), year=tags.get("year", "")[:4])
 
 
 def _read_tags(path: Path) -> tuple[dict[str, str], list[bytes], float]:
@@ -100,7 +104,8 @@ def _tags_and_pictures(audio) -> tuple[dict[str, str], list[bytes]]:
             return ""
 
         found = {"title": text("TIT2"), "artist": text("TPE1", "TPE2"), "album": text("TALB"),
-                 "albumartist": text("TPE2", "TPE1")}
+                 "albumartist": text("TPE2", "TPE1"), "genre": text("TCON"),
+                 "year": text("TDRC", "TYER")}
         pictures = [tags[k].data for k in tags.keys() if k.startswith("APIC")]
     elif tags is not None:  # Vorbis comments (FLAC)
         def text(*keys):
@@ -111,7 +116,8 @@ def _tags_and_pictures(audio) -> tuple[dict[str, str], list[bytes]]:
             return ""
 
         found = {"title": text("title"), "artist": text("artist", "albumartist"),
-                 "album": text("album"), "albumartist": text("albumartist", "artist")}
+                 "album": text("album"), "albumartist": text("albumartist", "artist"),
+                 "genre": text("genre"), "year": text("date", "year")}
     else:
         found = {}
     # FLAC keeps pictures outside the tags; prefer the front cover (type 3).

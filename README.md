@@ -10,8 +10,9 @@ It plays MP3, FLAC and WAV files from `~/Music`, organised in folders however yo
 - Shows battery level, and powers off cleanly when the battery is nearly empty
 - Plug it into a computer and `~/Music` shows up as a drive (MTP), so you can copy music on without the network
 - Plays through Bluetooth headphones or speakers: scan, pair and connect from the player itself
+- Counts how often you play each track, and builds smart playlists from that (most played, not heard for a while, recently added…), described by text files in `~/playlists`
 
-**Contents:** [Hardware](#hardware) · [Installation](#installation) · [Adding music](#adding-music) · [Buttons](#buttons) · [Bluetooth headphones](#bluetooth-headphones) · [Battery](#battery) · [Configuration](#configuration) · [Updating](#updating) · [Troubleshooting](#troubleshooting) · [Desktop simulator](#desktop-simulator) · [Tests](#tests) · [License](#license)
+**Contents:** [Hardware](#hardware) · [Installation](#installation) · [Adding music](#adding-music) · [Buttons](#buttons) · [Smart playlists](#smart-playlists) · [Bluetooth headphones](#bluetooth-headphones) · [Battery](#battery) · [Configuration](#configuration) · [Updating](#updating) · [Troubleshooting](#troubleshooting) · [Desktop simulator](#desktop-simulator) · [Tests](#tests) · [License](#license)
 
 ## Hardware
 
@@ -120,8 +121,9 @@ Either way, installing can take a while on a Pi Zero W, tens of minutes, mostly 
   - adds `dtoverlay=dwc2` for USB gadget mode;
   - turns off the onboard and HDMI audio, so the DAC is the only sound card.
 - **Kernel modules** (`/etc/modules-load.d/pirateplayer.conf`): `i2c-dev`, `dwc2`, `libcomposite`.
+- **Smart playlists:** creates `~/playlists` with some example playlists, if it doesn't exist yet, and keeps its `README.txt` up to date.
 - **Your user** joins the `gpio`, `spi`, `i2c` and `audio` groups, and may run `poweroff` without a password (`/etc/sudoers.d/pirateplayer`) for the low-battery shutdown.
-- **USB music drive:** writes `/etc/umtprd/umtprd.conf`, sharing `~/Music`, and installs the `pirateplayer-mtp` service that sets up the USB gadget.
+- **USB music drive:** writes `/etc/umtprd/umtprd.conf`, sharing `~/Music` and `~/playlists`, and installs the `pirateplayer-mtp` service that sets up the USB gadget.
 - **Bluetooth:** unblocks the radio (Raspberry Pi OS ships it blocked), and configures `bluealsa` to only send audio (`a2dp-source`), so the Pi doesn't offer itself as a speaker to phones.
 - **Services:** installs and enables `pirateplayer` (the player), `pirateplayer-mtp`, `bluetooth` and `bluealsa`.
 
@@ -145,11 +147,13 @@ Music lives in `~/Music` on the Pi, in whatever folders you like, for example `A
 
 Connect the Pi's micro-USB port labelled **USB** (the one nearer the middle, not **PWR**) to a computer. That port powers the Pi too, so one cable is enough, but it must be a data cable: many micro-USB cables only charge.
 
-The Pi appears as a media player called "Pirate Audio Player" with a single drive, `Music`, whose contents are `~/Music`. Windows and most Linux desktops open it like a phone; macOS has no built-in MTP support, so use an app such as [OpenMTP](https://openmtp.ganeshrvel.com/). Files you copy on belong to your user on the Pi.
+The Pi appears as a media player called "Pirate Audio Player" with two drives: `Music`, whose contents are `~/Music`, and `Playlists`, which is `~/playlists` (see [Smart playlists](#smart-playlists)). Windows and most Linux desktops open it like a phone; macOS has no built-in MTP support, so use an app such as [OpenMTP](https://openmtp.ganeshrvel.com/). Files you copy on belong to your user on the Pi.
 
-- The player sees new files as soon as you browse to their folder.
+- The player sees new files as soon as you browse to their folder. Smart playlists only see them after the library has been synced: at startup, or from **Settings → Sync library**.
 - Music added on the Pi while it's plugged in won't show on the computer until you reconnect: the Pi doesn't send change notifications, because the umtprd version in Debian hangs when it does.
 - Gadget mode means the USB port can't be used for a keyboard or other USB device.
+- Edit smart playlists on the `Playlists` drive like any text file. If your computer won't open a `.txt` file in place, copy it off, edit it, and copy it back. The player picks up changes the next time you open **Playlists**.
+- If you delete `~/playlists`, it comes back empty the next time the drive starts. To get the examples back, copy them from `~/pirateplayer/playlists`.
 - To turn the drive off: `sudo systemctl disable --now pirateplayer-mtp`.
 
 ### Copying music over the network
@@ -166,7 +170,13 @@ rsync -av --progress ~/Music/ <username>@pirateaudio.local:Music/
 
 Pirate Audio buttons: **A** top-left, **B** bottom-left, **X** top-right, **Y** bottom-right.
 
-The player starts at the **menu**, or at the now-playing screen if it's resuming a playlist. The menu has three rows: **Files**, the folders and tracks in `~/Music`; **Cover Flow**, your albums' covers flowing across the screen like on an iPod classic; and **Bluetooth**, for [headphones](#bluetooth-headphones). The Bluetooth row only appears if the Pi has Bluetooth.
+The player starts at the **menu**, or at the now-playing screen if it's resuming a playlist. The menu has these rows:
+
+- **Files**: the folders and tracks in `~/Music`.
+- **Cover Flow**: your albums' covers flowing across the screen like on an iPod classic.
+- **Playlists**: your [smart playlists](#smart-playlists).
+- **Bluetooth**: for [headphones](#bluetooth-headphones). Only there if the Pi has Bluetooth.
+- **Settings**: **Sync library** re-reads your music folder. It shows how many tracks the library has. Syncing pauses the music and locks the buttons until it's done (see [Smart playlists](#smart-playlists)).
 
 | | Menu | Files | Now playing |
 |---|---|---|---|
@@ -186,11 +196,51 @@ The player starts at the **menu**, or at the now-playing screen if it's resuming
 | **Y** | Back to the menu |
 | **Y** hold | Go to now playing |
 
-Cover Flow shows every folder of tracks that has a cover (a `cover.jpg` or the like in the folder, or art embedded in its first track), in alphabetical order of album name. The name and artist come from the first track's tags, or the folder's name if it has none. The player starts looking through `~/Music` for albums as soon as it starts, in the background, so they're usually ready by the time you open Cover Flow; on a big library, it says *Finding albums…* until they are. Each time you open it, it shows the albums it found last time while it checks again for changes. The first time, it also makes a small copy of each cover to flow through quickly; until it has, covers it hasn't reached yet can make the flow stutter.
+Cover Flow shows every folder of tracks that has a cover (a `cover.jpg` or the like in the folder, or art embedded in its first track), in alphabetical order of album name. The name and artist come from the first track's tags, or the folder's name if it has none. The player looks through `~/Music` for albums in the background as soon as it has [synced the library](#smart-playlists) at startup, so they're usually ready by the time you open Cover Flow; on a big library, it says *Finding albums…* until they are. Each time you open it, it shows the albums it found last time while it checks again for changes. The first time, it also makes a small copy of each cover to flow through quickly; until it has, covers it hasn't reached yet can make the flow stutter.
 
 "Go to now playing" does nothing until you've played something. When the screen is off, the first press only wakes it up.
 
 Powering off with A + B shuts the Pi down cleanly. Wait for the green light on the Pi to stop flashing before removing power. To switch back on, remove and reconnect power (on a battery board, use its power switch).
+
+## Smart playlists
+
+The player keeps an index of your music, with its tags, in a small database (`~/.local/state/pirateplayer/library.db`). It brings the index up to date every time it starts: the first time, on a Pi Zero W, that can take a few minutes for a big library, but later syncs only re-read files that changed. Syncing slows everything else down, so while it runs the screen shows a progress bar and the buttons are locked (holding **A**+**B** still powers off). To sync without restarting, for example after copying music over, open **Settings** and press **X** on **Sync library**.
+
+It also counts how often you play each track. A track counts as played once it has played for half its length or four minutes, whichever comes first (the rule Last.fm uses), or when it plays to the end. Pausing doesn't count towards that; skipping back to the start of a track and listening again is another play. Play counts are kept by file path, so moving or renaming a file starts its count again.
+
+A smart playlist is a text file in `~/playlists` describing which tracks to pick, and it's re-evaluated each time you play it. The installer puts some examples there: *Most played*, *On repeat* (most played this month), *Recently added*, *Forgotten favourites* and *Never played*. Edit them, or add your own, over USB (the `Playlists` drive), over the network, or on the Pi with `nano`. Changes show up the next time you open **Playlists**; there's no need to restart.
+
+```
+# ~/playlists/Jazz I haven't heard in a while.txt
+genre: jazz
+not played in: 6 months
+sort: random
+limit: 50
+```
+
+| Setting | |
+|---|---|
+| `sort` | `most played`, `least played`, `recently played`, `least recently played`, `recently added`, `random`, `album` (artist, album, track: the default) or `title` |
+| `limit` | At most this many tracks |
+| `period` | Only count plays this recent towards `min plays`, `max plays` and the most/least played order, e.g. `30 days`. Without it, every play counts |
+| `min plays` / `max plays` | Only tracks played at least / at most this many times. `max plays: 0` is tracks you've never played |
+| `played in` | Only tracks last played within this long, e.g. `1 week` |
+| `not played in` | Only tracks not played for this long, or never |
+| `added in` | Only tracks added to the player within this long |
+| `artist`, `album`, `genre` | Only tracks whose tag contains this text, ignoring case |
+| `folder` | Only tracks in this folder of `~/Music`, e.g. `Jazz/Miles Davis` |
+| `name` | The name to show, instead of the file name |
+
+Times are a number and `hours`, `days`, `weeks`, `months` or `years`; a bare number is days. `artist`, `album`, `genre` and `folder` can be given more than once, and a track matches if it matches any of them; different settings must all match. Lines starting with `#` are comments. `~/playlists/README.txt` has the same reference.
+
+| | Playlists |
+|---|---|
+| **A** / **B** | Up / down |
+| **X** | Play the playlist |
+| **Y** | Back to the menu |
+| **Y** hold | Go to now playing |
+
+If a line of a playlist doesn't make sense, the player skips it and marks the playlist *Has errors*; the log says what's wrong (`journalctl -u pirateplayer | grep Playlist`).
 
 ## Bluetooth headphones
 
@@ -246,6 +296,8 @@ sudo systemctl restart pirateplayer
 | `low_battery_percent` | `5` | Power off below this when not charging |
 | `audio_device` | `""` | mpv `--audio-device`, e.g. `"alsa/hw:0"`; empty uses the default (the Pirate Audio). See `mpv --audio-device=help` |
 | `bluetooth` | `true` | `false` hides the Bluetooth menu |
+| `playlists_dir` | `"~/playlists"` | Where your [smart playlists](#smart-playlists) are |
+| `database` | `"~/.local/state/pirateplayer/library.db"` | The library index and play counts. Delete it to start the counts again |
 
 ## Updating
 
@@ -270,6 +322,8 @@ Start with the log: `journalctl -u pirateplayer -b` shows everything the player 
 | Button Y does nothing | You have an early Pirate Audio board: set `y_pin = 20`. |
 | No battery gauge | Waveshare: `sudo apt install i2c-tools`, then `i2cdetect -y 1` should show `43`. PiSugar: `systemctl status pisugar-server` should be running. Or set `battery` explicitly to see a warning in the log. |
 | The USB drive doesn't appear | Use the port labelled **USB** and a data cable. `ls /sys/class/udc` should list a controller; if it's empty, reboot after running the installer. `journalctl -u pirateplayer-mtp` shows errors. |
+| A playlist plays nothing | Check the playlist's settings: `min plays` and `period` leave out tracks you haven't played enough. |
+| The **Playlists** row is missing | The library database couldn't be opened; the log says why. **Settings** shows *Unavailable*. |
 | No **Bluetooth** row in the menu | The log says why at startup (`Bluetooth unavailable: …`). Check `systemctl status bluetooth`. If the radio is blocked: `sudo rfkill unblock bluetooth`. |
 | A headset won't pair | Put it in pairing mode (usually holding the power button until a light flashes), keep it close, and scan again. If it was paired before, forget it on the player (hold **X**) and on the headset, then pair again. |
 | A headset connects but there's no sound | `systemctl status bluealsa` should be running. Reconnect the headset after restarting it: `sudo systemctl restart bluealsa`. |

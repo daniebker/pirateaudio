@@ -42,6 +42,12 @@ if [ ! -d "$G" ]; then
     ln -s "$G/functions/ffs.mtp" "$G/configs/c.1/"
 fi
 
+# Make sure every shared folder (~/Music, ~/playlists) exists, owned by $MTP_USER, so a
+# deleted one comes back as an empty drive instead of going missing from the host.
+sed -n 's/^storage[[:space:]]*"\([^"]*\)".*/\1/p' /etc/umtprd/umtprd.conf | while read -r dir; do
+    [ -d "$dir" ] || setpriv --reuid="$MTP_UID" --regid="$MTP_GID" --init-groups mkdir -p "$dir"
+done
+
 mkdir -p "$FFS"
 mount -t functionfs -o uid="$MTP_UID",gid="$MTP_GID" mtp "$FFS"
 

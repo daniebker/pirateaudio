@@ -13,6 +13,10 @@ class Config:
     state_file: Path = field(
         default_factory=lambda: Path.home() / ".local" / "state" / "pirateplayer" / "state.json"
     )
+    database: Path = field(
+        default_factory=lambda: Path.home() / ".local" / "state" / "pirateplayer" / "library.db"
+    )
+    playlists_dir: Path = field(default_factory=lambda: Path.home() / "playlists")
     cache_dir: Path = field(default_factory=lambda: Path.home() / ".cache" / "pirateplayer")
     volume: int = 50                 # starting volume (percent) if no saved state
     bluetooth_volume: int = 50       # the same for Bluetooth headphones, which keep their own

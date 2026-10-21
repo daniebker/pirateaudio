@@ -1,4 +1,5 @@
-"""Drawing the browser, cover flow, now-playing and Bluetooth screens."""
+"""Drawing the menu, browser, cover flow, now-playing, playlist, settings, Bluetooth and sync
+screens."""
 
 import math
 from functools import lru_cache
@@ -32,7 +33,15 @@ FONT_DIR = Path("/usr/share/fonts/truetype/dejavu")
 class MenuEntry(NamedTuple):
     """A row of the top-level menu, which opens another screen."""
     label: str
-    icon: str  # "folder", "covers" or "bluetooth"
+    icon: str  # "folder", "covers", "playlist", "settings" or "bluetooth"
+
+
+class Row(NamedTuple):
+    """A row of a list screen: a label, and a status at the right."""
+    label: str
+    status: str = ""
+    colour: tuple = FG
+    status_colour: tuple = DIM
 
 
 def _font(name: str, size: int):
@@ -88,6 +97,21 @@ def _folder_icon(draw, x: int, y: int, colour):
     draw.rectangle((x, y + 2, x + 16, y + 12), fill=colour)
 
 
+def _playlist_icon(draw, x: int, y: int, colour):
+    """Three lines of a list, 16x12 pixels with its top-left corner at x, y."""
+    for i in range(3):
+        draw.rectangle((x, y + i * 5, x + 16, y + i * 5 + 2), fill=colour)
+
+
+def _settings_icon(draw, x: int, y: int, colour):
+    """A cog, 14 pixels across with its top-left corner at x, y."""
+    cx, cy = x + 7, y + 7
+    draw.line((cx, y, cx, y + 14), fill=colour, width=3)
+    draw.line((x, cy, x + 14, cy), fill=colour, width=3)
+    draw.line((x + 2, y + 2, x + 12, y + 12), fill=colour, width=3)
+    draw.line((x + 2, y + 12, x + 12, y + 2), fill=colour, width=3)
+    draw.ellipse((x + 2, y + 2, x + 12, y + 12), fill=colour)
+    draw.ellipse((cx - 2, cy - 2, cx + 2, cy + 2), fill=BG)
 def _covers_icon(draw, x: int, y: int, colour):
     """Three covers in a row, the middle one facing out: 18x14 pixels, top-left at x, y."""
     draw.polygon([(x, y + 3), (x + 4, y + 1), (x + 4, y + 13), (x, y + 11)], fill=colour)
@@ -303,6 +327,12 @@ class Renderer:
             if entry.icon == "bluetooth":
                 colour = BLUE
                 _bluetooth_icon(draw, 16, y + 6, colour, h=14)
+            elif entry.icon == "playlist":
+                colour = GOOD
+                _playlist_icon(draw, 8, y + 7, colour)
+            elif entry.icon == "settings":
+                colour = DIM
+                _settings_icon(draw, 9, y + 6, colour)
             elif entry.icon == "covers":
                 colour = ACCENT
                 _covers_icon(draw, 7, y + 6, colour)
@@ -337,6 +367,38 @@ class Renderer:
         _scrollbar(draw, top, len(entries))
         return image
 
+    def list_screen(self, title: str, rows: list[Row], cursor: int, battery: BatteryStatus | None,
+                    playing: bool, bluetooth: bool = False, empty: str = "",
+                    message: str = "") -> Image.Image:
+        """A scrolling list of rows, with `empty` shown if there are none."""
+        image, draw = self._canvas()
+        self._header(image, title, battery, "▶" if playing else "", bluetooth)
+        if not rows and empty:
+            draw.multiline_text((SIZE // 2, SIZE // 2), empty, font=self.text, fill=DIM,
+                                anchor="mm", align="center")
+        top = _top(cursor, len(rows))
+        for i, row in enumerate(rows[top:top + ROWS]):
+            y = HEADER + i * ROW
+            if top + i == cursor:
+                draw.rectangle((0, y, SIZE, y + ROW - 1), fill=SELECTED)
+            right = SIZE - 10
+            if row.status:
+                status = _fit(row.status, self.small, SIZE // 2)
+                right -= int(draw.textlength(status, font=self.small))
+                draw.text((right, y + 6), status, font=self.small, fill=row.status_colour)
+            draw.text((8, y + 4), _fit(row.label, self.text, right - 16), font=self.text,
+                      fill=row.colour)
+        _scrollbar(draw, top, len(rows))
+        if message:
+            self._message_box(draw, message)
+        return image
+
+    def _message_box(self, draw, message: str):
+        lines = message.count("\n") + 1
+        box = 10 + 18 * lines
+        draw.rectangle((0, SIZE - box, SIZE, SIZE), fill=(26, 27, 36))
+        draw.multiline_text((SIZE // 2, SIZE - box // 2), message, font=self.small, fill=FG,
+                            anchor="mm", align="center")
     def cover_flow(self, albums: list[Album] | None, position: float,
                    battery: BatteryStatus | None, playing: bool,
                    bluetooth: bool = False) -> Image.Image:
@@ -440,11 +502,7 @@ class Renderer:
                                 "Put your headset\nin pairing mode", font=self.text, fill=DIM,
                                 anchor="ma", align="center")
         if message:
-            lines = message.count("\n") + 1
-            box = 10 + 18 * lines
-            draw.rectangle((0, SIZE - box, SIZE, SIZE), fill=(26, 27, 36))
-            draw.multiline_text((SIZE // 2, SIZE - box // 2), message, font=self.small, fill=FG,
-                                anchor="mm", align="center")
+            self._message_box(draw, message)
         return image
 
     def now_playing(self, info: TrackInfo | None, state: str, position: float, volume: int,
@@ -491,6 +549,27 @@ class Renderer:
             draw.rectangle((cx + 2, cy - 6, cx + 5, cy + 6), fill=FG)
         else:
             draw.rectangle((cx - 5, cy - 5, cx + 5, cy + 5), fill=FG)
+        return image
+
+    def indexing(self, done: int, total: int, battery: BatteryStatus | None) -> Image.Image:
+        """The library being synced. `total` is 0 while tracks are still being found."""
+        image, draw = self._canvas()
+        self._header(image, "Syncing library", battery)
+        cy = HEADER + (SIZE - HEADER) // 2
+        if total:
+            label, detail = "Reading tags", f"{done} of {total} tracks"
+            fraction = min(1.0, done / total)
+        else:
+            label, detail = "Finding music", f"{done} tracks so far"
+            fraction = 0.0
+        draw.text((SIZE // 2, cy - 34), label, font=self.bold, fill=FG, anchor="mm")
+        draw.rounded_rectangle((20, cy - 8, SIZE - 20, cy + 8), radius=8, fill=SELECTED)
+        filled = int((SIZE - 40) * fraction)
+        if filled >= 16:  # narrower than that, the rounded ends would overlap
+            draw.rounded_rectangle((20, cy - 8, 20 + filled, cy + 8), radius=8, fill=ACCENT)
+        draw.text((SIZE // 2, cy + 26), detail, font=self.text, fill=DIM, anchor="mm")
+        draw.text((SIZE // 2, SIZE - 20), "Buttons work again when it's done", font=self.small,
+                  fill=DIM, anchor="mm")
         return image
 
     def message(self, text: str) -> Image.Image:
