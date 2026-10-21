@@ -10,7 +10,7 @@ from pirateplayer import database as database_module
 from pirateplayer.app import (BLUETOOTH, BLUETOOTH_ENTRY, BROWSER, COVER_FLOW, COVERS_ENTRY,
                               FILES_ENTRY, LOW_BATTERY_READINGS, MENU, MESSAGE_TIME, NOW_PLAYING,
                               PLAY_MAX, PLAYLISTS, PLAYLISTS_ENTRY, SCAN_TIME, SETTINGS,
-                              SETTINGS_ENTRY, VOLUME_STEP, App)
+                              SETTINGS_ENTRY, VOLUME_STEP, App, open_library)
 from pirateplayer.battery import BatteryStatus
 from pirateplayer.bluetooth import CONNECTING, audio_device
 from pirateplayer.player import PAUSED, PLAYING, STOPPED
@@ -365,6 +365,46 @@ def test_albums_are_found_once_the_startup_sync_is_done(cfg, music, monkeypatch)
         a.indexer.join()
         a.tick(0.1)
         assert a.album_search is not None
+        check_albums_found(a, music)
+    finally:
+        a.close()
+
+
+def test_sync_started_before_the_app_carries_on(cfg, music, monkeypatch):
+    (music / "Album 1" / "cover.jpg").write_bytes(png_bytes())
+    release = threading.Event()
+    sync = database_module.sync
+    monkeypatch.setattr(database_module, "sync", lambda *args: release.wait(5) and sync(*args))
+    library = open_library(cfg)  # while mpv is starting
+    db, indexer = library
+    assert indexer.running
+    a = App(cfg, FakeDisplay(), FakeButtons(), None, FakePlayer(), simulate=True, library=library)
+    try:
+        monkeypatch.setattr(indexer, "start", lambda: pytest.fail("synced again"))
+        a.start()
+        a.tick(0.0)
+        assert a.syncing and a.db is db
+        assert a.album_search is None
+        release.set()
+        indexer.join()
+        a.tick(0.1)
+        assert a.album_search is not None
+        check_albums_found(a, music)
+    finally:
+        a.close()
+
+
+def test_sync_finished_before_the_app_started(cfg, music, monkeypatch):
+    (music / "Album 1" / "cover.jpg").write_bytes(png_bytes())
+    library = open_library(cfg)
+    library[1].join()  # a small library, synced before mpv was ready
+    a = App(cfg, FakeDisplay(), FakeButtons(), None, FakePlayer(), simulate=True, library=library)
+    try:
+        monkeypatch.setattr(library[1], "start", lambda: pytest.fail("synced again"))
+        a.start()
+        assert not a.syncing
+        assert a.album_search is not None
+        assert a.sync_status() == "5 tracks"
         check_albums_found(a, music)
     finally:
         a.close()
@@ -726,6 +766,44 @@ def test_syncing_from_settings_pauses_playback(app, monkeypatch):
     open_entry(app, SETTINGS_ENTRY)
     tap(app, "X")
     assert app.player.state == PAUSED
+
+
+def test_gapless_setting_queues_the_next_track(app, make_app):
+    app.on_button("X", btn.HOLD, 1.0)  # Album 1, from its first track
+    assert app.player.queued is None  # off by default
+    open_entry(app, SETTINGS_ENTRY)
+    assert app.settings_rows()[1].status == "Off"
+    tap(app, "B")
+    tap(app, "X")
+    assert app.gapless
+    assert app.settings_rows()[1].status == "On"
+    assert app.player.queued == app.playlist[1]
+    resumed = make_app()  # it's remembered
+    assert resumed.gapless
+    tap(app, "X")
+    assert not app.gapless
+    assert app.player.queued is None
+
+
+def test_gapless_follows_the_player_to_the_next_track(app):
+    app.gapless = True
+    app.on_button("X", btn.HOLD, 1.0)
+    first, second, third = app.playlist
+    assert app.player.queued == second
+    loads = len(app.player.loaded)
+    app.on_player_event("next", None)
+    assert app.db.play_count(first) == 1
+    assert (app.index, app.listened, app.counted) == (1, 0.0, False)
+    assert app.info.title == "02 Second"
+    assert len(app.player.loaded) == loads  # the player went on by itself
+    assert app.player.queued == third
+    app.on_player_event("next", None)
+    assert app.index == 2
+    assert app.player.queued is None  # the last track: nothing after it
+    app.player.state = STOPPED
+    app.on_player_event("ended", None)
+    assert app.index == 0
+    assert app.player.state == STOPPED
 
 
 def pretend_syncing(app, monkeypatch, done, total):

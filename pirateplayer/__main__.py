@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 from . import config
-from .app import App
+from .app import App, open_library
 from .battery import open_battery
 from .bluetooth import open_bluetooth
 from .player import Player
@@ -47,9 +47,10 @@ def main():
     # Turn SIGTERM (systemctl stop, shutdown) into a normal exit so state gets saved.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
+    library = open_library(cfg)  # syncs while mpv starts
     player = Player(cfg.audio_device)
     bluetooth = open_bluetooth() if cfg.bluetooth else None
-    app = App(cfg, display, buttons, battery, player, bluetooth=bluetooth)
+    app = App(cfg, display, buttons, battery, player, bluetooth=bluetooth, library=library)
     try:
         app.run()
     except KeyboardInterrupt:

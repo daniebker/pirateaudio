@@ -49,13 +49,18 @@ class FakePlayer:
         self.volume = None
         self.audio_device = None
         self.loaded: list[tuple[Path, float, bool]] = []
+        self.queued: Path | None = None
         self.seeks: list[float] = []
         self.polls = 0
 
     def load(self, path, start=0.0, paused=False):
         self.loaded.append((path, start, paused))
+        self.queued = None
         self.position = start
         self.state = PAUSED if paused else PLAYING
+
+    def queue(self, path):
+        self.queued = path
 
     def toggle_pause(self):
         if self.state == PLAYING:

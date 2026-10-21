@@ -176,7 +176,7 @@ The player starts at the **menu**, or at the now-playing screen if it's resuming
 - **Cover Flow**: your albums' covers flowing across the screen like on an iPod classic.
 - **Playlists**: your [smart playlists](#smart-playlists).
 - **Bluetooth**: for [headphones](#bluetooth-headphones). Only there if the Pi has Bluetooth.
-- **Settings**: **Sync library** re-reads your music folder. It shows how many tracks the library has. Syncing pauses the music and locks the buttons until it's done (see [Smart playlists](#smart-playlists)).
+- **Settings**: **Sync library** re-reads your music folder. It shows how many tracks the library has. Syncing pauses the music and locks the buttons until it's done (see [Smart playlists](#smart-playlists)). **Gapless playback** (off at first; **X** turns it on or off) plays each track straight after the last with no pause between them, for live albums and DJ mixes. The player remembers the setting.
 
 | | Menu | Files | Now playing |
 |---|---|---|---|

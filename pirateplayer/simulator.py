@@ -14,7 +14,7 @@ os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 import pygame
 from PIL import Image
 
-from .app import BLUETOOTH, BROWSER, COVER_FLOW, MENU, PLAYLISTS, SETTINGS, App
+from .app import BLUETOOTH, BROWSER, COVER_FLOW, MENU, PLAYLISTS, SETTINGS, App, open_library
 from .battery import BatteryStatus
 from .bluetooth import CONNECTING, DISCONNECTING, PAIRING, BtDevice, sort_devices
 from .buttons import PressTracker
@@ -69,6 +69,7 @@ class PygamePlayer:
         self._offset = 0.0     # track position when play() was last called
         self._volume = 0.5
         self._last_command = 0.0
+        self._next: Path | None = None  # to play straight after, for gapless playback
 
     @property
     def position(self) -> float:
@@ -91,12 +92,16 @@ class PygamePlayer:
 
     def load(self, path: Path, start: float = 0.0, paused: bool = False):
         self._last_command = time.monotonic()
+        self._next = None
         try:
             self.music.load(str(path))
             self._play_from(start, paused)
         except pygame.error as e:
             self.state = STOPPED
             self.events.put(("error", str(e)))
+
+    def queue(self, path: Path | None):
+        self._next = path  # not truly gapless: pygame only tells us a track ended by polling
 
     def toggle_pause(self):
         if self.state == PLAYING:
@@ -114,6 +119,7 @@ class PygamePlayer:
         self.music.stop()
         self.state = STOPPED
         self._offset = 0.0
+        self._next = None
 
     def seek(self, seconds: float):
         if self.state != STOPPED:
@@ -132,7 +138,10 @@ class PygamePlayer:
     def update(self):
         """Called every frame: notice when a track has finished."""
         settled = time.monotonic() - self._last_command > 0.3
-        if self.state == PLAYING and settled and not self.music.get_busy():
+        if self.state == PLAYING and settled and not self.music.get_busy() and self._next:
+            self.events.put(("next", None))
+            self.load(self._next)
+        elif self.state == PLAYING and settled and not self.music.get_busy():
             self.state = STOPPED
             self._offset = 0.0
             self.events.put(("ended", None))
@@ -368,10 +377,12 @@ class SimWindow:
 
 def run(cfg: Config, scale: int = 2, use_mpv: bool = False):
     window = SimWindow(scale)
+    library = open_library(cfg)  # syncs while mpv starts, like on the Pi
     player = Player(cfg.audio_device) if use_mpv else PygamePlayer()
     battery = SimBattery()
     bluetooth = SimBluetooth() if cfg.bluetooth else None
-    app = App(cfg, window, window, battery, player, simulate=True, bluetooth=bluetooth)
+    app = App(cfg, window, window, battery, player, simulate=True, bluetooth=bluetooth,
+              library=library)
     log.info("Music folder: %s", cfg.music_dir)
 
     clock = pygame.time.Clock()
