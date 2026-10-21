@@ -35,13 +35,15 @@ def check(image):
     assert image.mode == "RGB"
 
 
-def test_browser(music):
+def test_browser(music, monkeypatch):
     r = Renderer()
     entries = sorted(music.rglob("*"))
-    check(r.browser("Music", entries, 0, BatteryStatus(80, False), playing=True))
-    check(r.browser("Music", entries * 5, 20, BatteryStatus(5, True), playing=False))
-    check(r.browser("Empty", [], 0, None, playing=False))
-    check(r.browser("Music", entries, 1, None, playing=False, bluetooth=True))
+    # Drawing doesn't touch the disk: on a Pi, a stat per row makes scrolling lag.
+    monkeypatch.setattr("os.stat", lambda *a, **k: pytest.fail("stat while drawing"))
+    check(r.browser("Music", entries, 2, 0, BatteryStatus(80, False), playing=True))
+    check(r.browser("Music", entries * 5, 2, 20, BatteryStatus(5, True), playing=False))
+    check(r.browser("Empty", [], 0, 0, None, playing=False))
+    check(r.browser("Music", entries, 2, 1, None, playing=False, bluetooth=True))
 
 
 def test_menu():
@@ -81,8 +83,8 @@ def test_menu_cover_flow_icon():
 def test_bluetooth_icon_in_header(music):
     r = Renderer()
     header = (120, 0, SIZE, 26)
-    plain = r.browser("Music", [], 0, None, playing=False).crop(header)
-    with_bt = r.browser("Music", [], 0, None, playing=False, bluetooth=True).crop(header)
+    plain = r.browser("Music", [], 0, 0, None, playing=False).crop(header)
+    with_bt = r.browser("Music", [], 0, 0, None, playing=False, bluetooth=True).crop(header)
     assert BLUE not in plain.getdata()
     assert BLUE in with_bt.getdata()
 

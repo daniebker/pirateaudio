@@ -13,8 +13,8 @@ from . import buttons as btn
 from .bluetooth import audio_device
 from .config import Config
 from .database import Database, Indexer, open_database
-from .library import (Album, TrackInfo, album_thumbnail, find_albums, is_track, list_dir,
-                      prune_thumbnails, read_info, tracks_in)
+from .library import (Album, ReadAhead, TrackInfo, album_thumbnail, find_albums, is_track,
+                      prune_thumbnails, read_dir, read_info, tracks_in)
 from .player import PLAYING, STOPPED, Player
 from .playlists import SmartPlaylist, load_all
 from .ui import COVER, LOW, MenuEntry, Renderer, Row, prepare_cover_flow
@@ -92,8 +92,9 @@ class App:
         self.menu_cursor = 0
         self.root = cfg.music_dir
         self.cwd = self.root
-        self.entries = list_dir(self.cwd)
+        self.entries, self.dirs = read_dir(self.cwd)  # the first `dirs` entries are folders
         self.cursor = 0
+        self.read_ahead = ReadAhead()
 
         self.albums: list[Album] | None = None  # None until the first search finishes
         self.album_cursor = 0
@@ -232,8 +233,8 @@ class App:
                                 self.battery_status, self.player.state == PLAYING, bt)
         if self.screen == BROWSER:
             title = "Music" if self.cwd == self.root else self.cwd.name
-            return self.ui.browser(title, self.entries, self.cursor, self.battery_status,
-                                   self.player.state == PLAYING, bt)
+            return self.ui.browser(title, self.entries, self.dirs, self.cursor,
+                                   self.battery_status, self.player.state == PLAYING, bt)
         if self.screen == COVER_FLOW:
             return self.ui.cover_flow(self.albums, self.flow_position, self.battery_status,
                                       self.player.state == PLAYING, bt)
@@ -315,15 +316,15 @@ class App:
     def browser_button(self, name: str, kind: str):
         if name in ("A", "B") and self.entries:
             self.cursor = move_cursor(self.cursor, len(self.entries), -1 if name == "A" else 1, kind)
+            self.read_ahead_selected()
         elif name == "X" and kind != btn.REPEAT and self.entries:
             entry = self.entries[self.cursor]
-            if entry.is_dir() and kind == btn.TAP:
+            if self.cursor < self.dirs and kind == btn.TAP:
                 self.open_dir(entry)
-            elif entry.is_dir():
+            elif self.cursor < self.dirs:
                 self.play(tracks_in(entry, recursive=True), 0)
             else:
-                tracks = [p for p in self.entries if not p.is_dir()]
-                self.play(tracks, tracks.index(entry))
+                self.play(list(self.entries[self.dirs:]), self.cursor - self.dirs)
         elif name == "Y" and kind == btn.TAP:
             if self.cwd != self.root:
                 self.open_dir(self.cwd.parent, select=self.cwd)
@@ -361,9 +362,14 @@ class App:
         if not directory.is_relative_to(self.root):
             directory = self.root
         self.cwd = directory
-        self.entries = list_dir(directory)
+        self.entries, self.dirs = read_dir(directory)
         self.cursor = self.entries.index(select) if select in self.entries else 0
+        self.read_ahead_selected()
 
+    def read_ahead_selected(self):
+        """Read the folder under the cursor in the background, so it opens without a wait."""
+        if self.cursor < self.dirs:
+            self.read_ahead.request(self.entries[self.cursor])
     # ---- playlists -----------------------------------------------------------
 
     def open_playlists(self):

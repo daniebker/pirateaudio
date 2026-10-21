@@ -1,9 +1,13 @@
+import os
+import threading
+
+import pytest
 from mutagen.id3 import APIC, TALB, TIT2, TPE1, TPE2
 from mutagen.wave import WAVE
 
-from pirateplayer.library import (_natural_key, _riff_info, album_art, album_thumbnail,
-                                  find_albums, is_track, list_dir, prune_thumbnails, read_info,
-                                  tracks_in)
+from pirateplayer.library import (ReadAhead, _natural_key, _riff_info, album_art,
+                                  album_thumbnail, find_albums, is_track, prune_thumbnails,
+                                  read_dir, read_info, tracks_in)
 
 from .conftest import make_wav, png_bytes
 
@@ -26,16 +30,47 @@ def test_is_track(tmp_path):
     assert not is_track(tmp_path / "missing.mp3")
 
 
-def test_list_dir_folders_first_and_skips_hidden_and_other_files(music):
+def test_read_dir_folders_first_and_skips_hidden_and_other_files(music):
     (music / ".hidden").mkdir()
     (music / ".secret.wav").touch()
     (music / "notes.txt").touch()
-    assert [p.name for p in list_dir(music)] == ["Album 1", "Album 2", "loose.wav"]
-    assert [p.name for p in list_dir(music / "Album 1")] == ["01 First.wav", "02 Second.wav", "10 Tenth.wav"]
+    (music / "folder.wav").mkdir()  # a folder, whatever it's called
+    listing = read_dir(music)
+    assert [p.name for p in listing.entries] == ["Album 1", "Album 2", "folder.wav", "loose.wav"]
+    assert listing.dirs == 3
+    assert [p.name for p in read_dir(music / "Album 1").entries] == [
+        "01 First.wav", "02 Second.wav", "10 Tenth.wav"]
 
 
-def test_list_dir_missing(tmp_path):
-    assert list_dir(tmp_path / "missing") == []
+def test_read_dir_missing(tmp_path):
+    assert read_dir(tmp_path / "missing") == ((), 0)
+
+
+def test_read_dir_remembers_until_the_folder_changes(music, monkeypatch):
+    first = read_dir(music)
+    monkeypatch.setattr("os.scandir", lambda *a: pytest.fail("read again"))
+    assert read_dir(music) is first
+    monkeypatch.undo()
+    make_wav(music / "new.wav")
+    os.utime(music, ns=(0, 1))  # make sure the mtime differs, however coarse the clock
+    assert [p.name for p in read_dir(music).entries][-1] == "new.wav"
+
+
+def test_read_ahead_reads_the_latest_request(music, monkeypatch):
+    read = threading.Event()
+    asked = []
+
+    def fake_read_dir(directory):
+        asked.append(directory)
+        read.set()
+    monkeypatch.setattr("pirateplayer.library.read_dir", fake_read_dir)
+    ahead = ReadAhead()
+    ahead.request(music / "Album 1")
+    assert read.wait(5)
+    read.clear()
+    ahead.request(music / "Album 2")
+    assert read.wait(5)
+    assert asked[-1] == music / "Album 2"
 
 
 def test_tracks_in(music):

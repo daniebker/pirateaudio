@@ -2,6 +2,7 @@
 screens."""
 
 import math
+from collections.abc import Sequence
 from functools import lru_cache
 from pathlib import Path
 from typing import NamedTuple
@@ -347,8 +348,9 @@ class Renderer:
                 draw.text((SIZE - 10, y + 6), text, font=self.small, fill=GOOD, anchor="ra")
         return image
 
-    def browser(self, title: str, entries: list[Path], cursor: int,
+    def browser(self, title: str, entries: Sequence[Path], dirs: int, cursor: int,
                 battery: BatteryStatus | None, playing: bool, bluetooth: bool = False) -> Image.Image:
+        """Files: the first `dirs` entries are folders, the rest tracks."""
         image, draw = self._canvas()
         self._header(image, title, battery, "▶" if playing else "", bluetooth)
         if not entries:
@@ -360,7 +362,7 @@ class Renderer:
             y = HEADER + row * ROW
             if top + row == cursor:
                 draw.rectangle((0, y, SIZE, y + ROW - 1), fill=SELECTED)
-            is_dir = entry.is_dir()
+            is_dir = top + row < dirs  # known already: a stat per row makes scrolling lag
             label = entry.name + "/" if is_dir else entry.stem
             draw.text((8, y + 4), _fit(label, self.text, SIZE - 22), font=self.text,
                       fill=ACCENT if is_dir else FG)

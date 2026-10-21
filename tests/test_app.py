@@ -89,6 +89,18 @@ def test_cursor_wraps_on_tap_and_clamps_on_repeat(app):
     assert app.cursor == 2
 
 
+def test_the_folder_under_the_cursor_is_read_ahead(app, music, monkeypatch):
+    requested = []
+    monkeypatch.setattr(app.read_ahead, "request", requested.append)
+    tap(app, "B")  # Album 2
+    tap(app, "B")  # loose.wav: not a folder
+    assert requested == [music / "Album 2"]
+    tap(app, "X")  # play it, without reading anything
+    tap(app, "Y")
+    app.open_dir(music)
+    assert requested == [music / "Album 2", music / "Album 1"]
+
+
 def test_open_folder_and_go_back(app, music):
     tap(app, "B")
     tap(app, "X")
