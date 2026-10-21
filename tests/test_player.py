@@ -1,5 +1,6 @@
 import json
 import queue
+import threading
 
 import pytest
 
@@ -23,6 +24,11 @@ def player():
     p.state = STOPPED
     p.position = 0.0
     p._loading = False
+    p._lock = threading.Lock()
+    p._queue_lock = threading.RLock()
+    p._loaded = False
+    p._next = None
+    p._queued = False
     return p
 
 
@@ -123,3 +129,50 @@ def test_pause_and_audio_device(player, tmp_path):
         ["set_property", "audio-device", "alsa/bluealsa:DEV=00:1A:7D:DA:71:13,PROFILE=a2dp"],
         ["set_property", "audio-device", "auto"],
     ]
+
+
+def test_queue_waits_for_the_track_to_load(player, tmp_path):
+    player.load(tmp_path / "a.mp3", start=30.0)
+    player.queue(tmp_path / "b.mp3")
+    assert player._sock.sent[-1][0] == "loadfile"  # not yet: "start" would apply to it too
+    player._sock.sent.clear()
+    player._handle({"event": "start-file"})
+    player._handle({"event": "file-loaded"})
+    assert player._sock.sent == [["set_property", "start", "0"],
+                                 ["loadfile", str(tmp_path / "b.mp3"), "append-play"]]
+
+
+def test_queued_track_follows_without_stopping(player, tmp_path):
+    player.load(tmp_path / "a.mp3")
+    player._handle({"event": "start-file"})
+    player._handle({"event": "file-loaded"})
+    player.queue(tmp_path / "b.mp3")
+    player.position = 200.0
+    player._handle({"event": "end-file", "reason": "eof"})
+    assert events(player) == [("next", None)]
+    assert player.state == PLAYING
+    assert player.position == 0.0
+    player._handle({"event": "start-file"})
+    player._sock.sent.clear()
+    player.queue(tmp_path / "c.mp3")  # before mpv has opened b: waits for it
+    assert player._sock.sent == []
+    player._handle({"event": "file-loaded"})
+    assert player._sock.sent[-1] == ["loadfile", str(tmp_path / "c.mp3"), "append-play"]
+    player._handle({"event": "end-file", "reason": "eof"})
+    player._handle({"event": "start-file"})
+    player._handle({"event": "file-loaded"})
+    player._handle({"event": "end-file", "reason": "eof"})  # nothing queued after c
+    assert events(player) == [("next", None), ("ended", None)]
+    assert player.state == STOPPED
+
+
+def test_unqueue(player, tmp_path):
+    player.load(tmp_path / "a.mp3")
+    player._handle({"event": "start-file"})
+    player._handle({"event": "file-loaded"})
+    player.queue(tmp_path / "b.mp3")
+    player._sock.sent.clear()
+    player.queue(None)
+    assert player._sock.sent == [["playlist-clear"]]
+    player._handle({"event": "end-file", "reason": "eof"})
+    assert events(player) == [("ended", None)]

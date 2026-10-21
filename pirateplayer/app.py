@@ -12,7 +12,7 @@ from pathlib import Path
 from . import buttons as btn
 from .bluetooth import audio_device
 from .config import Config
-from .database import Indexer, open_database
+from .database import Database, Indexer, open_database
 from .library import (Album, TrackInfo, album_thumbnail, find_albums, is_track, list_dir,
                       prune_thumbnails, read_info, tracks_in)
 from .player import PLAYING, STOPPED, Player
@@ -44,7 +44,7 @@ COVERS_ENTRY = MenuEntry("Cover Flow", "covers")
 PLAYLISTS_ENTRY = MenuEntry("Playlists", "playlist")
 BLUETOOTH_ENTRY = MenuEntry("Bluetooth", "bluetooth")
 SETTINGS_ENTRY = MenuEntry("Settings", "settings")
-SYNC_ROW = 0  # rows of the settings screen
+SYNC_ROW, GAPLESS_ROW = 0, 1  # rows of the settings screen
 
 
 def move_cursor(cursor: int, count: int, step: int, kind: str) -> int:
@@ -54,9 +54,19 @@ def move_cursor(cursor: int, count: int, step: int, kind: str) -> int:
     return min(max(0, cursor + step), count - 1)
 
 
+def open_library(cfg: Config) -> tuple[Database | None, Indexer | None]:
+    """Open the library database and start bringing it up to date. Done first thing at startup,
+    so that the sync gets on while mpv is starting."""
+    db = open_database(cfg.database)
+    indexer = Indexer(db, cfg.music_dir) if db else None
+    if indexer:
+        indexer.start()
+    return db, indexer
+
+
 class App:
     def __init__(self, cfg: Config, display, buttons, battery, player: Player, simulate=False,
-                 bluetooth=None):
+                 bluetooth=None, library: tuple[Database | None, Indexer | None] | None = None):
         self.cfg = cfg
         self.display = display
         self.buttons = buttons
@@ -67,8 +77,8 @@ class App:
         self.cover_cache = cfg.cache_dir / "covers"
         self.ui = Renderer(self.cover_cache)
 
-        self.db = open_database(cfg.database)
-        self.indexer = Indexer(self.db, cfg.music_dir) if self.db else None
+        # From open_library(), which has usually started syncing it already.
+        self.db, self.indexer = library if library is not None else open_library(cfg)
         self.syncs_seen = 0  # the indexer's count of finished syncs, when we last looked
         self.was_syncing = False  # whether it was running, when we last looked
 
@@ -101,6 +111,7 @@ class App:
         self.playlists: list[SmartPlaylist] = []
         self.playlist_cursor = 0
         self.settings_cursor = 0
+        self.gapless = False  # play each track straight after the last, with no gap
 
         self.playlist: list[Path] = []
         self.index = 0
@@ -139,12 +150,12 @@ class App:
         self.display.set_backlight(True)
         self.restore_state()
         self.now = self.last_input = self.last_tick = time.monotonic()
-        if self.indexer:
+        if self.indexer and not (self.indexer.running or self.indexer.finished):
             # It takes minutes for a big library, and slows everything else down while it runs,
             # so the buttons are locked and the screen shows its progress until it's done.
             # The search for Cover Flow albums waits for it, rather than slowing it further.
-            self.indexer.start()
-        else:
+            self.indexer.start()  # if open_library() didn't, or it failed
+        if not self.syncing:
             # So that Cover Flow has its albums ready by the time it's opened.
             self.start_album_search()
         if self.bluetooth and self.bt_last:
@@ -400,7 +411,8 @@ class App:
         return f"{count} track{'' if count == 1 else 's'}"
 
     def settings_rows(self) -> list[Row]:
-        return [Row("Sync library", self.sync_status())]
+        return [Row("Sync library", self.sync_status()),
+                Row("Gapless playback", "On" if self.gapless else "Off")]
 
     def settings_button(self, name: str, kind: str):
         rows = self.settings_rows()
@@ -413,6 +425,10 @@ class App:
             elif self.indexer.start():
                 self.player.pause()  # the buttons are locked until it's done
                 self.save_state()
+        elif name == "X" and kind == btn.TAP and self.settings_cursor == GAPLESS_ROW:
+            self.gapless = not self.gapless
+            self.queue_next()
+            self.save_state()
         elif name == "Y" and kind == btn.TAP:
             self.open_menu(SETTINGS_ENTRY)
         elif name == "Y" and kind == btn.HOLD and self.playlist:
@@ -622,8 +638,25 @@ class App:
         self.listened, self.counted = listened, counted
         self.player.set_volume(self.volume)
         self.player.load(path, start=start, paused=paused)
+        self.queue_next()
         self.save_state()
         self.dirty = True
+
+    def queue_next(self):
+        """With gapless playback, have the player ready to go straight on to the next track."""
+        following = self.index + 1
+        if self.gapless and following < len(self.playlist):
+            self.player.queue(self.playlist[following])
+        else:
+            self.player.queue(None)
+
+    def went_to_next(self):
+        """The player has gone straight on to the next track by itself: catch up with it."""
+        self.index += 1
+        self.info = read_info(self.playlist[self.index])
+        self.listened, self.counted = 0.0, False
+        self.queue_next()
+        self.save_state()
 
     def skip(self, step: int):
         if not self.playlist:
@@ -666,6 +699,10 @@ class App:
                 self.info = read_info(self.playlist[0]) if self.playlist else None
                 self.player.position = 0
                 self.save_state()
+        elif kind == "next" and self.index + 1 < len(self.playlist):
+            self.count_play()
+            self.failures = 0
+            self.went_to_next()
         elif kind == "error" and self.playlist:
             log.warning("Can't play %s: %s", self.playlist[self.index], detail)
             self.failures += 1
@@ -722,6 +759,7 @@ class App:
             "bluetooth": self.bt_last,
             "listened": self.listened,
             "counted": self.counted,
+            "gapless": self.gapless,
         }
         path = self.cfg.state_file
         try:
@@ -741,6 +779,7 @@ class App:
         self.speaker_volume = int(state.get("volume", self.speaker_volume))
         self.bluetooth_volume = int(state.get("bluetooth_volume", self.bluetooth_volume))
         self.bt_last = state.get("bluetooth")
+        self.gapless = bool(state.get("gapless", False))
         self.player.set_volume(self.volume)
         playlist = [Path(p) for p in state.get("playlist", [])]
         index = int(state.get("index", 0))
