@@ -35,6 +35,8 @@ KEYS = {
     pygame.K_x: "X", pygame.K_RETURN: "X", pygame.K_RIGHT: "X",
     pygame.K_y: "Y", pygame.K_ESCAPE: "Y", pygame.K_LEFT: "Y", pygame.K_BACKSPACE: "Y",
 }
+# The connected headset's buttons: play/pause, next, previous.
+HEADSET_KEYS = {pygame.K_p: "PlayPause", pygame.K_n: "Next", pygame.K_v: "Previous"}
 HINTS = {
     MENU: {"A": "Up", "B": "Down", "X": "Open", "Y": "Playing"},
     BROWSER: {"A": "Up", "B": "Down", "X": "Open", "Y": "Back"},
@@ -252,6 +254,14 @@ class SimBluetooth:
                 self.events.put(("audio", None))
                 self.events.put(("changed", None))
 
+    def press(self, control: str):
+        """A button on the connected headset, as BlueZ would pass it on."""
+        if self.connected():
+            self.events.put(("control", control))
+
+    def now_playing(self, state: str, position: float, metadata: dict | None):
+        pass
+
     def forget(self, address: str):
         self.switch_off(address)
         self._devices.pop(address, None)
@@ -407,6 +417,8 @@ def run(cfg: Config, scale: int = 2, use_mpv: bool = False):
                     app.check_battery()
                 elif event.type == pygame.KEYDOWN and event.key == pygame.K_h and bluetooth:
                     bluetooth.switch_off()
+                elif event.type == pygame.KEYDOWN and event.key in HEADSET_KEYS and bluetooth:
+                    bluetooth.press(HEADSET_KEYS[event.key])
                 elif event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP):
                     window.handle_mouse(event)
 
@@ -418,7 +430,7 @@ def run(cfg: Config, scale: int = 2, use_mpv: bool = False):
             charger = "charger connected" if battery.external_power else "on battery"
             audio = "mpv" if use_mpv else "pygame"
             if bluetooth and bluetooth.connected():
-                audio = f"{bluetooth.connected()} [H] switch off"
+                audio = f"{bluetooth.connected()} [H] switch off  [P/N/V] its buttons"
             window.status = (f"Battery {battery.percent:.0f}% ({charger})  [C] charger  [-/=] level"
                              f"   ·   audio: {audio}")
             window.draw()

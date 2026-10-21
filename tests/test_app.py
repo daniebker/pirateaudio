@@ -646,6 +646,59 @@ def test_headset_connecting_switches_audio_and_is_remembered(bt_app, cfg):
     assert json.loads(cfg.state_file.read_text())["bluetooth"] == HEADSET.address
 
 
+def test_headset_buttons(bt_app):
+    tap(bt_app, "X")  # Files
+    bt_app.on_button("X", btn.HOLD, 1.0)  # play Album 1
+    for press, state in [("PlayPause", PAUSED), ("PlayPause", PLAYING),
+                         ("Pause", PAUSED), ("Play", PLAYING),
+                         ("Play", PAUSED),  # headsets that send Play every time still pause
+                         ("Pause", PLAYING)]:
+        bt_app.bluetooth.events.put(("control", press))
+        bt_app.tick(1.0)
+        assert bt_app.player.state == state, press
+    bt_app.on_bluetooth_event("control", "Next")
+    assert bt_app.index == 1
+    bt_app.on_bluetooth_event("control", "Previous")
+    assert bt_app.index == 0
+    bt_app.player.position = 30.0
+    bt_app.on_bluetooth_event("control", "Previous")
+    assert bt_app.index == 0
+    assert bt_app.player.seeks == [0]  # back to the start of the track first
+    bt_app.on_bluetooth_event("control", "Stop")
+    assert bt_app.player.state == PAUSED
+    bt_app.player.state = STOPPED  # the end of the playlist
+    bt_app.on_bluetooth_event("control", "Play")
+    assert bt_app.player.state == PLAYING
+
+
+def test_screen_follows_the_player_pausing_later(bt_app):
+    tap(bt_app, "X")  # Files
+    bt_app.on_button("X", btn.HOLD, 1.0)
+    bt_app.tick(1.0)
+    shown = len(bt_app.display.images)
+    bt_app.tick(1.05)
+    assert len(bt_app.display.images) == shown  # nothing new to show
+    bt_app.player.state = PAUSED  # as mpv reports it, after the press was drawn
+    bt_app.tick(1.1)
+    assert len(bt_app.display.images) == shown + 1
+
+
+def test_headset_is_told_what_is_playing(bt_app):
+    def reports():
+        return [c for c in bt_app.bluetooth.calls if c[0] == "now_playing"]
+    bt_app.tick(1.0)
+    assert reports() == [("now_playing", STOPPED, None)]
+    tap(bt_app, "X")  # Files
+    bt_app.on_button("X", btn.HOLD, 1.0)
+    bt_app.tick(1.1)
+    bt_app.tick(1.2)  # only changes are reported
+    assert reports()[1:] == [("now_playing", PLAYING, "01 First")]
+    bt_app.player.toggle_pause()
+    bt_app.skip(1)
+    bt_app.tick(1.3)
+    assert reports()[2:] == [("now_playing", PLAYING, "02 Second")]
+
+
 def test_headset_going_away_pauses_and_returns_to_speaker(bt_app, cfg):
     cfg.audio_device = "alsa/hw:0"
     tap(bt_app, "X")  # Files

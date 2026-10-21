@@ -11,7 +11,7 @@ import unicodedata
 from pathlib import Path
 
 from . import buttons as btn
-from .bluetooth import audio_device
+from .bluetooth import audio_device, player_metadata
 from .config import Config
 from .database import Database, Indexer, open_database
 from .library import (Album, ReadAhead, TrackInfo, album_thumbnail, find_albums, is_track,
@@ -117,6 +117,7 @@ class App:
         self.bt_selected: str | None = None  # address of the selected device; None = the scan row
         self.bt_audio: str | None = None     # address of the headset we're playing to
         self.bt_last: str | None = None      # the last headset played to, to reconnect at startup
+        self.bt_reported = None  # what the headset was last told is playing
         self.scan_until = 0.0
         self.message = ""
         self.message_until = 0.0
@@ -129,6 +130,7 @@ class App:
         self.playlist: list[Path] = []
         self.index = 0
         self.info: TrackInfo | None = None
+        self.shown_state = None  # the player's state when the screen was last marked for redrawing
         self.failures = 0  # consecutive tracks that failed to play
         self.listened = 0.0   # seconds the current track has played for
         self.counted = False  # whether this play of the current track has been counted
@@ -201,6 +203,11 @@ class App:
 
         while not self.player.events.empty():
             self.on_player_event(*self.player.events.get())
+        if self.player.state != self.shown_state:
+            # mpv says it has paused or carried on a moment after it's asked to, by which time
+            # the screen has been drawn for the press, and a headset can pause it unasked.
+            self.shown_state = self.player.state
+            self.dirty = True
 
         if self.bluetooth:
             self.tick_bluetooth(now)
@@ -362,11 +369,7 @@ class App:
             self.volume = min(100, max(0, self.volume + step))
             self.player.set_volume(self.volume)
         elif name == "X" and kind == btn.TAP:
-            if self.player.state == STOPPED and self.playlist:
-                self.start_track()
-            else:
-                self.player.toggle_pause()
-                self.save_state()
+            self.play_pause()
         elif name == "X" and kind == btn.HOLD:
             self.skip(1)
         elif name == "Y" and kind == btn.TAP:
@@ -375,11 +378,7 @@ class App:
                 current = self.playlist[self.index]
                 self.open_dir(current.parent, select=current)
         elif name == "Y" and kind == btn.HOLD:
-            if self.player.position > RESTART_THRESHOLD:
-                self.player.seek(0)
-                self.listened, self.counted = 0.0, False  # listening again is another play
-            else:
-                self.skip(-1)
+            self.previous()
 
     def entry_group(self, index: int) -> tuple[bool, str]:
         """Folders and tracks are lettered separately, as folders all come first."""
@@ -632,6 +631,7 @@ class App:
             self.on_bluetooth_event(*self.bluetooth.events.get())
         if self.bluetooth.scanning and now >= self.scan_until:
             self.bluetooth.stop_scan()
+        self.report_playing()
         # Count the scan down on screen.
         if self.screen == BLUETOOTH and self.bluetooth.scanning and now - self.last_poll >= 1.0:
             self.last_poll = now
@@ -640,6 +640,8 @@ class App:
     def on_bluetooth_event(self, kind: str, detail):
         if kind == "audio":
             self.route_audio(detail)
+        elif kind == "control":
+            self.headset_button(detail)
         elif kind == "error":
             self.show_message(detail)
         self.dirty = True
@@ -660,6 +662,31 @@ class App:
         self.bt_audio = address
         self.player.set_volume(self.volume)
         self.save_state()
+
+    def headset_button(self, name: str):
+        """Play/pause, next or previous, pressed on the headset."""
+        if name in ("Play", "Pause", "PlayPause"):
+            # Each press changes what's happening, whichever the headset asked for: many send
+            # Play every time, or only know whether we're playing from a press ago.
+            self.play_pause()
+        elif name == "Stop":
+            self.player.pause()
+            self.save_state()
+        elif name == "Next":
+            self.skip(1)
+        elif name == "Previous":
+            self.previous()
+
+    def report_playing(self):
+        """Tell the headset when playback starts, stops or changes track."""
+        track = self.playlist[self.index] if self.playlist else None
+        if (self.player.state, track) == self.bt_reported:
+            return
+        self.bt_reported = (self.player.state, track)
+        info = self.info
+        metadata = (player_metadata(info.title, info.artist, info.album, info.length)
+                    if info else None)
+        self.bluetooth.now_playing(self.player.state, self.player.position, metadata)
 
     def headset_name(self) -> str:
         """The name of the headset we're playing to, for the menu."""
@@ -710,6 +737,21 @@ class App:
         self.listened, self.counted = 0.0, False
         self.queue_next()
         self.save_state()
+
+    def play_pause(self):
+        if self.player.state == STOPPED and self.playlist:
+            self.start_track()
+        else:
+            self.player.toggle_pause()
+            self.save_state()
+
+    def previous(self):
+        """Back to the start of this track, or to the one before if it's only just started."""
+        if self.player.position > RESTART_THRESHOLD:
+            self.player.seek(0)
+            self.listened, self.counted = 0.0, False  # listening again is another play
+        else:
+            self.skip(-1)
 
     def skip(self, step: int):
         if not self.playlist:

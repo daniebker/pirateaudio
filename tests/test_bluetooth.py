@@ -2,7 +2,8 @@ import queue
 
 from pirateplayer.bluetooth import (A2DP_SINK_UUID, CONNECTING, DEVICE, PCM, SINK_GRACE,
                                     Bluetooth, BtDevice, address_from_path, audio_device, is_audio,
-                                    pick_sink, visible_devices)
+                                    pick_sink, player_metadata, player_status,
+                                    visible_devices)
 
 HEADPHONES_CLASS = 0x240404  # Audio/Video major class, wearable headset minor class
 PHONE_CLASS = 0x5A020C
@@ -123,3 +124,15 @@ def test_pcm_gone_for_good_is_reported_after_the_grace_period():
     bt._sink_lost_at -= SINK_GRACE
     bt.poll()
     assert bt.events.get() == ("audio", None)
+
+
+def test_player_status():
+    assert [player_status(s) for s in ("playing", "paused", "stopped")] == [
+        "Playing", "Paused", "Stopped"]
+
+
+def test_player_metadata():
+    assert player_metadata("Song", "Band", "Record", 61.5) == {
+        "xesam:title": "Song", "xesam:artist": ["Band"], "xesam:album": "Record",
+        "mpris:length": 61_500_000}
+    assert player_metadata("Song", "", "", 0.0) == {"xesam:title": "Song", "mpris:length": 0}
