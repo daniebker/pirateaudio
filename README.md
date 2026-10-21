@@ -180,13 +180,15 @@ The player starts at the **menu**, or at the now-playing screen if it's resuming
 
 | | Menu | Files | Now playing |
 |---|---|---|---|
-| **A** | Up | Up (hold to scroll) | Volume up |
-| **B** | Down | Down (hold to scroll) | Volume down |
+| **A** | Up | Up (hold to jump back a letter) | Volume up |
+| **B** | Down | Down (hold to jump on a letter) | Volume down |
 | **X** | Open | Open folder / play the folder starting from this track | Play / pause |
 | **X** hold | Open | Play the whole folder, including subfolders | Next track |
 | **Y** | Go to now playing | Parent folder (at the top: back to the menu) | Back to Files, with the current track selected |
 | **Y** hold | Go to now playing | Go to now playing | Previous track (or restart the current one if you're more than 3s in) |
 | **A + B** hold 3s | Power off | Power off | Power off |
+
+In **Files**, holding **B** jumps down to the first folder starting with the next letter, and on to the next one every half second while you hold it; **A** jumps back the same way. The letter shows in the middle of the screen. Tracks are lettered separately from folders, and names starting with a digit or symbol come under **#**.
 
 | | Cover Flow |
 |---|---|
