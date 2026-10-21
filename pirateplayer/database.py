@@ -1,7 +1,7 @@
 """The music library index and play history, kept in SQLite.
 
-Tracks are indexed in the background: on a Pi Zero, reading the tags of a big library takes
-minutes. Later syncs only re-read files whose size or modification time changed.
+Tracks are indexed in a background thread while the app shows its progress: on a Pi Zero,
+reading the tags of a big library takes minutes. Later syncs only re-read files whose size or modification time changed.
 
 Plays are kept in their own table, by path, rather than as a count on the track: a track
 that disappears from the index (say, while its folder is being renamed) gets its history
@@ -162,15 +162,26 @@ def _walk(root: Path):
 def sync(db: Database, root: Path, progress=None, stop: threading.Event | None = None) -> int:
     """Bring the index in line with the files under root; return how many tracks there are.
 
-    `progress(count)` is called as tracks are found. Setting `stop` abandons the sync, leaving
-    what's been indexed so far.
+    `progress(done, total)` is called as tracks are found, with a total of 0 until they all have
+    been, and then as each is checked. Setting `stop` abandons the sync, leaving what's been
+    indexed so far.
     """
+    # Find everything first, so progress can be shown as a fraction of the whole.
+    paths: list[Path] = []
+    for path in _walk(root):
+        if stop is not None and stop.is_set():
+            return 0
+        paths.append(path)
+        if progress:
+            progress(len(paths), 0)
     known = db.known()
     seen: set[str] = set()
     batch: list[dict] = []
-    for path in _walk(root):
+    for done, path in enumerate(paths, start=1):
         if stop is not None and stop.is_set():
             break
+        if progress:
+            progress(done, len(paths))
         key = str(path)
         try:
             st = path.stat()
@@ -188,8 +199,6 @@ def sync(db: Database, root: Path, progress=None, stop: threading.Event | None =
             if len(batch) >= BATCH:
                 db.put_tracks(batch)
                 batch = []
-        if progress:
-            progress(len(seen))
     if batch:
         db.put_tracks(batch)
     if stop is None or not stop.is_set():
@@ -203,7 +212,8 @@ class Indexer:
     def __init__(self, db: Database, root: Path):
         self.db = db
         self.root = root
-        self.found = 0          # tracks found so far by the running sync
+        self.done = 0           # tracks found, then checked, so far by the running sync
+        self.total = 0          # tracks the running sync has to check; 0 while still finding them
         self.last_count: int | None = None  # tracks found by the last finished sync
         self.finished = 0       # syncs finished, so callers can tell when another one has
         self._thread: threading.Thread | None = None
@@ -217,7 +227,7 @@ class Indexer:
         """Start a sync, unless one is running already."""
         if self.running:
             return False
-        self.found = 0
+        self.done = self.total = 0
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="indexer", daemon=True)
         self._thread.start()
@@ -234,8 +244,8 @@ class Indexer:
         self.finished += 1
         log.info("Indexed %d tracks in %.1fs", count, time.monotonic() - started)
 
-    def _progress(self, count: int):
-        self.found = count
+    def _progress(self, done: int, total: int):
+        self.done, self.total = done, total
 
     def join(self, timeout: float | None = None):
         if self._thread is not None:

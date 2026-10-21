@@ -586,6 +586,7 @@ def test_settings_syncs_the_library(app, music):
     tap(app, "X")
     assert app.indexer.running or app.indexer.last_count == 6
     app.indexer.join()
+    assert not app.syncing
     app.tick(5.0)
     assert app.message == "Synced 6 tracks"
     assert app.settings_rows()[0].status == "6 tracks"
@@ -595,22 +596,64 @@ def test_settings_syncs_the_library(app, music):
     assert app.menu[app.menu_cursor] is SETTINGS_ENTRY
 
 
-def test_settings_wont_start_a_second_sync(app, monkeypatch):
+def test_syncing_from_settings_pauses_playback(app, monkeypatch):
+    tap(app, "B")
+    tap(app, "B")
+    tap(app, "X")  # loose.wav
+    assert app.player.state == PLAYING
+    monkeypatch.setattr(app.indexer, "start", lambda: True)
     open_entry(app, SETTINGS_ENTRY)
-    monkeypatch.setattr(app.indexer, "start", lambda: False)
     tap(app, "X")
-    assert app.message == "Already syncing"
+    assert app.player.state == PAUSED
 
 
-def test_menu_shows_sync_progress(app, monkeypatch):
-    app.screen = MENU
-    app.indexer.found = 42
+def pretend_syncing(app, monkeypatch, done, total):
+    app.indexer.done, app.indexer.total = done, total
     monkeypatch.setattr(type(app.indexer), "running", property(lambda self: True))
-    assert app.sync_status() == "Syncing… 42"
+
+
+def test_buttons_are_locked_while_syncing(app, monkeypatch):
+    pretend_syncing(app, monkeypatch, 3, 10)
+    for name in "ABXY":
+        tap(app, name)
+    assert app.screen == BROWSER
+    assert app.cursor == 0
+    assert app.player.loaded == []
+    monkeypatch.undo()
+    tap(app, "B")
+    assert app.cursor == 1  # unlocked once it's done
+
+
+def test_sync_progress_is_shown_and_redrawn(app, monkeypatch):
+    shown = []
+    monkeypatch.setattr(app.ui, "indexing", lambda done, total, battery: shown.append((done, total)))
+    pretend_syncing(app, monkeypatch, 42, 0)
     app.display.images.clear()
-    app.dirty = False
     app.tick(5.0)
-    assert app.display.images  # redrawn to count up
+    app.indexer.done, app.indexer.total = 7, 50
+    app.tick(5.5)  # too soon to redraw
+    app.tick(6.0)
+    assert shown == [(42, 0), (7, 50)]
+
+
+def test_screen_is_redrawn_when_a_sync_ends_even_if_it_failed(app, monkeypatch):
+    pretend_syncing(app, monkeypatch, 1, 2)
+    app.tick(5.0)
+    monkeypatch.undo()  # stopped, without finishing
+    app.display.images.clear()
+    app.tick(5.1)
+    assert app.display.images
+
+
+def test_power_off_works_while_syncing(app, monkeypatch):
+    pretend_syncing(app, monkeypatch, 1, 2)
+    app.on_button(btn.COMBO, btn.HOLD, 1.0)
+    assert not app.running
+
+
+def test_sync_screen_draws(app):
+    for done, total in ((0, 0), (12, 0), (0, 100), (1, 100), (100, 100)):
+        assert app.ui.indexing(done, total, None).size == app.ui.message("x").size
 
 
 # ---- playlists --------------------------------------------------------------------

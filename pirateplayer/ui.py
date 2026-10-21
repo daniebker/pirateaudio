@@ -1,4 +1,4 @@
-"""Drawing the menu, browser, now-playing, playlist, settings and Bluetooth screens."""
+"""Drawing the menu, browser, now-playing, playlist, settings, Bluetooth and sync screens."""
 
 from functools import lru_cache
 from pathlib import Path
@@ -324,6 +324,27 @@ class Renderer:
             draw.rectangle((cx + 2, cy - 6, cx + 5, cy + 6), fill=FG)
         else:
             draw.rectangle((cx - 5, cy - 5, cx + 5, cy + 5), fill=FG)
+        return image
+
+    def indexing(self, done: int, total: int, battery: BatteryStatus | None) -> Image.Image:
+        """The library being synced. `total` is 0 while tracks are still being found."""
+        image, draw = self._canvas()
+        self._header(draw, "Syncing library", battery)
+        cy = HEADER + (SIZE - HEADER) // 2
+        if total:
+            label, detail = "Reading tags", f"{done} of {total} tracks"
+            fraction = min(1.0, done / total)
+        else:
+            label, detail = "Finding music", f"{done} tracks so far"
+            fraction = 0.0
+        draw.text((SIZE // 2, cy - 34), label, font=self.bold, fill=FG, anchor="mm")
+        draw.rounded_rectangle((20, cy - 8, SIZE - 20, cy + 8), radius=8, fill=SELECTED)
+        filled = int((SIZE - 40) * fraction)
+        if filled >= 16:  # narrower than that, the rounded ends would overlap
+            draw.rounded_rectangle((20, cy - 8, 20 + filled, cy + 8), radius=8, fill=ACCENT)
+        draw.text((SIZE // 2, cy + 26), detail, font=self.text, fill=DIM, anchor="mm")
+        draw.text((SIZE // 2, SIZE - 20), "Buttons work again when it's done", font=self.small,
+                  fill=DIM, anchor="mm")
         return image
 
     def message(self, text: str) -> Image.Image:

@@ -175,7 +175,7 @@ The player starts at the **menu**, or at the now-playing screen if it's resuming
 - **Files**: the folders and tracks in `~/Music`.
 - **Playlists**: your [smart playlists](#smart-playlists).
 - **Bluetooth**: for [headphones](#bluetooth-headphones). Only there if the Pi has Bluetooth.
-- **Settings**: **Sync library** re-reads your music folder. It shows how many tracks the library has, or the count so far while a sync is running.
+- **Settings**: **Sync library** re-reads your music folder. It shows how many tracks the library has. Syncing pauses the music and locks the buttons until it's done (see [Smart playlists](#smart-playlists)).
 
 | | Menu | Files | Now playing |
 |---|---|---|---|
@@ -193,7 +193,7 @@ Powering off with A + B shuts the Pi down cleanly. Wait for the green light on t
 
 ## Smart playlists
 
-The player keeps an index of your music, with its tags, in a small database (`~/.local/state/pirateplayer/library.db`). It brings the index up to date in the background every time it starts: the first time, on a Pi Zero W, that can take a few minutes for a big library, but later syncs only re-read files that changed. To sync without restarting, for example after copying music over, open **Settings** and press **X** on **Sync library**.
+The player keeps an index of your music, with its tags, in a small database (`~/.local/state/pirateplayer/library.db`). It brings the index up to date every time it starts: the first time, on a Pi Zero W, that can take a few minutes for a big library, but later syncs only re-read files that changed. Syncing slows everything else down, so while it runs the screen shows a progress bar and the buttons are locked (holding **A**+**B** still powers off). To sync without restarting, for example after copying music over, open **Settings** and press **X** on **Sync library**.
 
 It also counts how often you play each track. A track counts as played once it has played for half its length or four minutes, whichever comes first (the rule Last.fm uses), or when it plays to the end. Pausing doesn't count towards that; skipping back to the start of a track and listening again is another play. Play counts are kept by file path, so moving or renaming a file starts its count again.
 
@@ -310,7 +310,7 @@ Start with the log: `journalctl -u pirateplayer -b` shows everything the player 
 | Button Y does nothing | You have an early Pirate Audio board: set `y_pin = 20`. |
 | No battery gauge | Waveshare: `sudo apt install i2c-tools`, then `i2cdetect -y 1` should show `43`. PiSugar: `systemctl status pisugar-server` should be running. Or set `battery` explicitly to see a warning in the log. |
 | The USB drive doesn't appear | Use the port labelled **USB** and a data cable. `ls /sys/class/udc` should list a controller; if it's empty, reboot after running the installer. `journalctl -u pirateplayer-mtp` shows errors. |
-| A playlist plays nothing | *Nothing yet: still indexing* means the first sync hasn't finished; wait for the count under **Settings** to stop. Otherwise check the playlist's settings: `min plays` and `period` leave out tracks you haven't played enough. |
+| A playlist plays nothing | Check the playlist's settings: `min plays` and `period` leave out tracks you haven't played enough. |
 | The **Playlists** row is missing | The library database couldn't be opened; the log says why. **Settings** shows *Unavailable*. |
 | No **Bluetooth** row in the menu | The log says why at startup (`Bluetooth unavailable: …`). Check `systemctl status bluetooth`. If the radio is blocked: `sudo rfkill unblock bluetooth`. |
 | A headset won't pair | Put it in pairing mode (usually holding the power button until a light flashes), keep it close, and scan again. If it was paired before, forget it on the player (hold **X**) and on the headset, then pair again. |

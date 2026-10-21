@@ -110,5 +110,5 @@ def test_indexer_runs_in_the_background_once_at_a_time(tmp_path, music):
     assert indexer.start()
     indexer.join()
     assert not indexer.running
-    assert indexer.last_count == indexer.found == 5
+    assert indexer.last_count == indexer.done == indexer.total == 5
     assert db.track_count() == 5

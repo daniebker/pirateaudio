@@ -14,7 +14,7 @@ from .database import Indexer, open_database
 from .library import TrackInfo, is_track, list_dir, read_info, tracks_in
 from .player import PLAYING, STOPPED, Player
 from .playlists import SmartPlaylist, load_all
-from .ui import DIM, GOOD, LOW, MenuEntry, Renderer, Row
+from .ui import LOW, MenuEntry, Renderer, Row
 
 log = logging.getLogger(__name__)
 
@@ -26,6 +26,7 @@ VOLUME_STEP = 5
 RESTART_THRESHOLD = 3.0   # "previous" restarts the track if we're further in than this
 SCAN_TIME = 30.0          # seconds a Bluetooth scan runs for
 MESSAGE_TIME = 5.0        # seconds a message stays up
+SYNC_REDRAW = 1.0         # seconds between redraws of the sync progress
 # A track counts as played once it has played for half its length or 4 minutes, whichever is
 # sooner (the rule Last.fm uses), or when it plays to the end.
 PLAY_FRACTION = 0.5
@@ -62,6 +63,7 @@ class App:
         self.db = open_database(cfg.database)
         self.indexer = Indexer(self.db, cfg.music_dir) if self.db else None
         self.syncs_seen = 0  # the indexer's count of finished syncs, when we last looked
+        self.was_syncing = False  # whether it was running, when we last looked
 
         self.screen = MENU
         self.menu = [FILES_ENTRY]
@@ -124,7 +126,9 @@ class App:
         self.restore_state()
         self.now = self.last_input = self.last_tick = time.monotonic()
         if self.indexer:
-            self.indexer.start()  # in the background: it takes minutes for a big library
+            # It takes minutes for a big library, and slows everything else down while it runs,
+            # so the buttons are locked and the screen shows its progress until it's done.
+            self.indexer.start()
         if self.bluetooth and self.bt_last:
             # Most headsets connect back by themselves when switched on, but not all.
             self.bluetooth.connect(self.bt_last, quiet=True)
@@ -172,7 +176,8 @@ class App:
             if now - self.last_save >= SAVE_INTERVAL:
                 self.last_save = now
                 self.save_state()
-            if self.awake and self.screen == NOW_PLAYING and now - self.last_poll >= 1.0:
+            if (self.awake and self.screen == NOW_PLAYING and not self.syncing
+                    and now - self.last_poll >= 1.0):
                 self.last_poll = now
                 self.player.poll_position()
                 self.dirty = True
@@ -188,6 +193,8 @@ class App:
 
     def render(self):
         bt = self.bt_audio is not None
+        if self.syncing:
+            return self.ui.indexing(self.indexer.done, self.indexer.total, self.battery_status)
         if self.screen == MENU:
             status = {BLUETOOTH_ENTRY: self.headset_name(), SETTINGS_ENTRY: self.sync_status()}
             return self.ui.menu(self.menu, self.menu_cursor, status,
@@ -228,6 +235,8 @@ class App:
         if name == btn.COMBO:
             self.power_off("Powering off…")
             return
+        if self.syncing:
+            return  # locked until the library is synced
         if self.screen == MENU:
             self.menu_button(name, kind)
         elif self.screen == BROWSER:
@@ -347,24 +356,24 @@ class App:
         if tracks:
             log.info("Playing playlist %s: %d tracks", pl.name, len(tracks))
             self.play(tracks, 0)
-        elif self.indexer.running:
-            self.show_message("Nothing yet:\nstill indexing your music")
         else:
             self.show_message(f"No tracks match\n{pl.name}")
 
     # ---- settings ------------------------------------------------------------
 
+    @property
+    def syncing(self) -> bool:
+        """Whether the library is being synced, which locks the buttons."""
+        return self.indexer is not None and self.indexer.running
+
     def sync_status(self) -> str:
         if self.indexer is None:
             return "Unavailable"
-        if self.indexer.running:
-            return f"Syncing… {self.indexer.found}"
         count = self.db.track_count()
         return f"{count} track{'' if count == 1 else 's'}"
 
     def settings_rows(self) -> list[Row]:
-        running = self.indexer is not None and self.indexer.running
-        return [Row("Sync library", self.sync_status(), status_colour=GOOD if running else DIM)]
+        return [Row("Sync library", self.sync_status())]
 
     def settings_button(self, name: str, kind: str):
         rows = self.settings_rows()
@@ -374,22 +383,25 @@ class App:
         elif name == "X" and kind == btn.TAP and self.settings_cursor == SYNC_ROW:
             if self.indexer is None:
                 self.show_message("The library database\ncouldn't be opened")
-            elif not self.indexer.start():
-                self.show_message("Already syncing")
+            elif self.indexer.start():
+                self.player.pause()  # the buttons are locked until it's done
+                self.save_state()
         elif name == "Y" and kind == btn.TAP:
             self.open_menu(SETTINGS_ENTRY)
         elif name == "Y" and kind == btn.HOLD and self.playlist:
             self.screen = NOW_PLAYING
 
     def tick_indexer(self, now: float):
+        running = self.indexer.running
+        if running != self.was_syncing:  # locked or unlocked: swap the progress screen in or out
+            self.was_syncing = running
+            self.dirty = True
         if self.indexer.finished != self.syncs_seen:
             self.syncs_seen = self.indexer.finished
-            self.dirty = True
             if self.screen == SETTINGS:
                 self.show_message(f"Synced {self.indexer.last_count} tracks")
-        # Count the tracks found on screen.
-        if self.indexer.running and self.screen in (MENU, SETTINGS) and now - self.last_poll >= 1.0:
-            self.last_poll = now
+        elif running and now - self.last_poll >= SYNC_REDRAW:
+            self.last_poll = now  # move the progress bar along
             self.dirty = True
 
     # ---- bluetooth ---------------------------------------------------------
